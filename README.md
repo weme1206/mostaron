@@ -4,7 +4,7 @@
 
 mostaron 是一个面向 Android 的 **AI 角色扮演聊天**应用：你用自己的 API Key 连接任意 OpenAI 兼容接口，创建/编辑角色，与它们进行沉浸式单聊与**群聊**。它把角色卡、世界书、长期记忆、主题与聊天气泡等角色扮演要素都放在本地（SQLite），数据由你掌控。
 
-> 本项目为个人学习/开源分享用途，**代码主体由 AI 生成**（GitHub Copilot / AI 辅助），仅供学习参考。
+> 本项目为个人学习/开源分享用途，**代码主体由 AI 生成**，仅供学习参考。
 
 参考 [LettuceAI](https://github.com/LettuceAI/app) 与 [TavernAI](https://github.com/TavernAI/TavernAI) 的开源设计（角色卡 / 世界书 / 记忆 / 提示词模板），本工程为个人重写实现。
 
