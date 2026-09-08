@@ -13,8 +13,11 @@ class MessageBubble extends StatelessWidget {
   final Widget? topContent; // 气泡上方（昵称下方）内容，如思考
   final Color? bubbleColor; // 自定义气泡颜色
   final double bubbleOpacity;
+  final double fontScale; // 全局字体倍率
+  final bool highlight; // 是否高亮（查找命中）
   final VoidCallback? onCopy;
   final VoidCallback? onDelete;
+  final VoidCallback? onDeleteFromHere; // 删除该消息之后的所有消息
 
   const MessageBubble({
     super.key,
@@ -28,8 +31,11 @@ class MessageBubble extends StatelessWidget {
     this.topContent,
     this.bubbleColor,
     this.bubbleOpacity = 1.0,
+    this.fontScale = 1.0,
+    this.highlight = false,
     this.onCopy,
     this.onDelete,
+    this.onDeleteFromHere,
   });
 
   @override
@@ -82,6 +88,7 @@ class MessageBubble extends StatelessWidget {
                               bottomLeft: Radius.circular(isUser ? 16 : 4),
                               bottomRight: Radius.circular(isUser ? 4 : 16),
                             ),
+                            border: highlight ? Border.all(color: scheme.primary, width: 2) : null,
                           ),
                           constraints:
                               BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
@@ -102,7 +109,7 @@ class MessageBubble extends StatelessWidget {
                                   ),
                               ],
                             ),
-                            style: TextStyle(color: textColor, fontSize: 15.5, height: 1.4),
+                            style: TextStyle(color: textColor, fontSize: 15.5 * fontScale, height: 1.4),
                           ),
                         ),
                         if (footer != null) Padding(padding: const EdgeInsets.only(top: 2), child: footer),
@@ -146,6 +153,15 @@ class MessageBubble extends StatelessWidget {
                 onDelete?.call();
               },
             ),
+            if (onDeleteFromHere != null)
+              ListTile(
+                leading: const Icon(Icons.delete_sweep),
+                title: const Text('删除从这里开始的消息'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  onDeleteFromHere?.call();
+                },
+              ),
           ],
         ),
       ),

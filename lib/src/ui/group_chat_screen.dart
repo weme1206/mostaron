@@ -16,10 +16,13 @@ import 'character_editor_screen.dart';
 import 'memory_screen.dart';
 import 'worldbook_screen.dart';
 import 'worldbook_picker.dart';
+import 'widgets/search_history_screen.dart';
+import 'widgets/ai_rewrite_button.dart';
 
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
-  const GroupChatScreen({super.key, required this.groupId});
+  final String? initialSearchTargetId; // 查找聊天记录后定位到某条消息
+  const GroupChatScreen({super.key, required this.groupId, this.initialSearchTargetId});
 
   @override
   State<GroupChatScreen> createState() => _GroupChatScreenState();
@@ -41,6 +44,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   int _turn = 0; // 用于轮流回复起始位置
   bool _userScrolled = false;
   bool _programmaticJump = false;
+  int _searchReturnIndex = -1;
+  bool _inputRewriting = false;
 
   @override
   void initState() {
@@ -79,6 +84,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _loading = false;
     });
     _userScrolled = false;
+    if (widget.initialSearchTargetId != null) {
+      _jumpToMessage(widget.initialSearchTargetId!);
+    }
     for (final ms in const [0, 50, 200]) {
       Future.delayed(Duration(milliseconds: ms), () {
         if (mounted && !_userScrolled) _jumpToBottom(animate: false);
@@ -205,6 +213,34 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     setState(() => _messages.removeWhere((x) => x.id == m.id));
   }
 
+  /// 删除该消息及其之后的所有消息，并同步删除记忆（取决于记忆模式）。
+  Future<void> _deleteFromHere(ChatMessage m) async {
+    final state = context.read<AppState>();
+    final g = _group;
+    if (g == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('删除从这里开始的消息'),
+        content: const Text('将删除这条消息及其之后的所有消息，并清除这些消息产生的长期记忆。确定？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final idx = _messages.indexWhere((x) => x.id == m.id);
+    if (idx < 0) return;
+    final groupWhole = g.memoryMode == 'whole';
+    final owners = groupWhole
+        ? ['group_${g.id}']
+        : _members.values.map((c) => c.id).toList();
+    await state.deleteMessagesFrom(null, g.id, m.createdAt, memoryOwners: owners);
+    setState(() => _messages = _messages.sublist(0, idx));
+    _jumpToBottom(animate: false);
+  }
+
   Future<void> _editMessage(ChatMessage m, {bool isUser = false}) async {
     final ctrl = TextEditingController(text: m.content);
     final ok = await showDialog<bool>(
@@ -239,8 +275,90 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
-  Future<void> _regenerateMessage(ChatMessage m) async {
+  /// 让角色继续接着上一条回复自然续写（不插入用户消息，角色自己生成新消息）。
+  Future<void> _continueReply() async {
     if (_streaming) return;
+    final state = context.read<AppState>();
+    final g = _group;
+    if (g == null) return;
+    // 找到最后一条角色消息所属角色
+    ChatMessage? last;
+    for (int i = _messages.length - 1; i >= 0; i--) {
+      if (_messages[i].role == 'assistant' && _messages[i].senderCharacterId != null) {
+        last = _messages[i];
+        break;
+      }
+    }
+    if (last == null || !_members.containsKey(last!.senderCharacterId)) return;
+    final character = _members[last.senderCharacterId]!;
+    final histories = _messages.where((m) => m.role != 'system').toList();
+    final gwb = g.worldbookIds.isEmpty
+        ? <WorldbookEntry>[]
+        : (await state.worldbookFor(null)).where((e) => g.worldbookIds.contains(e.id)).toList();
+    final groupWhole = g.memoryMode == 'whole';
+    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(character.id);
+    final groupMems = groupWhole ? await state.memoriesFor('group_${g.id}') : <MemoryItem>[];
+    final payload = PromptBuilder.buildGroupMessages(
+      character: character,
+      eff: _eff,
+      worldbook: gwb,
+      memories: charMems,
+      groupMemories: groupMems,
+      history: histories,
+      groupNames: _members.values.map((m) => m.name).toList(),
+      replyStyle: g.replyStyle,
+    );
+    payload.add({
+      'role': 'user',
+      'content': '请接着你上一句话继续说下去，自然续写，不要重复。',
+    });
+    final provider = _providerFor(character, state);
+    if (provider == null) return;
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    setState(() {
+      _streaming = true;
+      _streamSender = character.name;
+      _streamText = '';
+      _streamReasoning = '';
+    });
+    _jumpToBottom();
+    try {
+      await for (final delta in ApiClient().streamChat(
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        model: _replyModelFor(character, provider),
+        messages: payload,
+        temperature: 0.9,
+      )) {
+        if (!mounted) return;
+        if (delta.content.isNotEmpty) setState(() => _streamText += delta.content);
+        if (delta.reasoning.isNotEmpty) setState(() => _streamReasoning += delta.reasoning);
+      }
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _streamText += '\n[错误] ${e.message}');
+    }
+    final asst = ChatMessage(
+      id: id,
+      groupId: g.id,
+      role: 'assistant',
+      senderCharacterId: character.id,
+      content: _streamText.trim(),
+      reasoning: _streamReasoning.trim(),
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    await state.insertMessage(asst);
+    if (mounted) {
+      setState(() {
+        _messages.add(asst);
+        _streaming = false;
+        _streamText = '';
+        _streamReasoning = '';
+      });
+    }
+    _jumpToBottom();
+  }
+
+  Future<void> _regenerateMessage(ChatMessage m) async {
     final state = context.read<AppState>();
     final g = _group;
     if (g == null || m.senderCharacterId == null) return;
@@ -296,6 +414,26 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
+  /// 润色一句话，用于输入框的 AI 改写按钮（用群聊默认接口）。
+  Future<String> _rewriteText(String text) async {
+    final state = context.read<AppState>();
+    final provider = state.getProviderById(null);
+    if (provider == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先配置接口')));
+      return text;
+    }
+    final result = await ApiClient().completeChat(
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      model: provider.model,
+      messages: [
+        {'role': 'system', 'content': '把下面这句话润色成更自然的角色扮演输入，保留原意，直接输出。'},
+        {'role': 'user', 'content': text},
+      ],
+    );
+    return result.trim();
+  }
+
   Future<void> _rewriteUser(ChatMessage m) async {
     final state = context.read<AppState>();
     final provider = state.getProviderById(null);
@@ -318,10 +456,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         ],
       )).trim();
       if (mounted) {
+        setState(() => _generating = false);
+        // 改写后替换原消息并让群聊自动回复
+        await state.updateMessageContent(m.id, text);
         setState(() {
-          _input.text = text;
-          _generating = false;
+          final idx = _messages.indexWhere((x) => x.id == m.id);
+          if (idx >= 0) _messages[idx] = _messages[idx].copyWith(content: text);
         });
+        if (_group != null && _group!.replyMode != 'designated') {
+          await _triggerReplies(state, _group!);
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -334,7 +478,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Widget _actionFooter(AppState state, ChatMessage m) {
     final scheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       decoration: BoxDecoration(
         color: Theme.of(context).brightness == Brightness.dark
             ? Colors.black.withValues(alpha: 0.35)
@@ -343,32 +487,28 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ),
       child: m.role == 'user'
           ? Row(mainAxisSize: MainAxisSize.min, children: [
-              _btn(scheme, Icons.delete_outline, '删除', () => _deleteMessage(m)),
-              _btn(scheme, Icons.edit, '编辑', () => _editMessage(m, isUser: true)),
-              _btn(scheme, Icons.auto_awesome, 'AI改写', () => _rewriteUser(m)),
+              _btn(scheme, Icons.delete_outline, () => _deleteMessage(m)),
+              _btn(scheme, Icons.edit, () => _editMessage(m, isUser: true)),
+              _btn(scheme, Icons.arrow_forward_ios, () => _continueReply()),
+              _btn(scheme, Icons.auto_awesome, () => _rewriteUser(m)),
             ])
           : Row(mainAxisSize: MainAxisSize.min, children: [
-              _btn(scheme, Icons.refresh, '重生成', () => _regenerateMessage(m)),
-              _btn(scheme, Icons.delete_outline, '删除', () => _deleteMessage(m)),
-              _btn(scheme, Icons.edit, '编辑', () => _editMessage(m)),
-              _btn(scheme, Icons.chat_bubble_outline, '生成我的回复', () => _generateMyReply()),
+              _btn(scheme, Icons.refresh, () => _regenerateMessage(m)),
+              _btn(scheme, Icons.delete_outline, () => _deleteMessage(m)),
+              _btn(scheme, Icons.edit, () => _editMessage(m)),
+              _btn(scheme, Icons.arrow_forward_ios, () => _continueReply()),
+              _btn(scheme, Icons.chat_bubble_outline, () => _generateMyReply()),
             ]),
     );
   }
 
-  Widget _btn(ColorScheme scheme, IconData icon, String label, VoidCallback onTap) {
+  Widget _btn(ColorScheme scheme, IconData icon, VoidCallback onTap) {
     return InkWell(
       onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 14, color: scheme.primary),
-            const SizedBox(width: 2),
-            Text(label, style: TextStyle(fontSize: 11, color: scheme.primary)),
-          ],
-        ),
+        padding: const EdgeInsets.all(7),
+        child: Icon(icon, size: 19, color: scheme.primary),
       ),
     );
   }
@@ -391,12 +531,16 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final gwb = g.worldbookIds.isEmpty
         ? <WorldbookEntry>[]
         : (await state.worldbookFor(null)).where((e) => g.worldbookIds.contains(e.id)).toList();
+    // 记忆模式：whole=群整体；separate/synced=按角色独立
+    final bool groupWhole = g.memoryMode == 'whole';
+    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(character.id);
+    final groupMems = groupWhole ? await state.memoriesFor('group_${g.id}') : <MemoryItem>[];
     final payload = PromptBuilder.buildGroupMessages(
       character: character,
       eff: _eff,
       worldbook: gwb,
-      memories: await state.memoriesFor(character.id),
-      groupMemories: await state.memoriesFor('group_${g.id}'),
+      memories: charMems,
+      groupMemories: groupMems,
       history: histories,
       groupNames: _members.values.map((m) => m.name).toList(),
       replyStyle: g.replyStyle,
@@ -471,11 +615,23 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         ],
       )).trim();
       if (t.isNotEmpty && t != '无' && t != '"无"') {
-        await state.addMemory(MemoryItem(
-          id: DateTime.now().microsecondsSinceEpoch.toString(),
-          characterId: 'group_${g.id}',
-          content: t,
-        ));
+        final groupWhole = g.memoryMode == 'whole';
+        if (groupWhole) {
+          await state.addMemory(MemoryItem(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
+            characterId: 'group_${g.id}',
+            content: t,
+          ));
+        } else {
+          // separate/synced：整体记忆按每个成员各记一条（synced 会与私聊同步到同一 key）
+          for (final m in _members.values) {
+            await state.addMemory(MemoryItem(
+              id: DateTime.now().microsecondsSinceEpoch.toString() + '_${m.id}',
+              characterId: m.id,
+              content: t,
+            ));
+          }
+        }
       }
     } catch (_) {}
   }
@@ -493,6 +649,62 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       }
       _programmaticJump = false;
     });
+  }
+
+  /// 查找聊天记录后跳转到某条消息，高亮它。
+  void _jumpToMessage(String id) {
+    final idx = _messages.indexWhere((m) => m.id == id);
+    if (idx < 0 || !mounted) return;
+    setState(() => _searchReturnIndex = idx);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _programmaticJump = true;
+      final target = _messages.length == 0
+          ? 0.0
+          : (_scroll.position.maxScrollExtent * (idx / _messages.length))
+              .clamp(0.0, _scroll.position.maxScrollExtent);
+      _scroll.animateTo(target, duration: const Duration(milliseconds: 350), curve: Curves.easeOut);
+      _programmaticJump = false;
+    });
+  }
+
+  /// 选择成员查看其独立记忆（separate/synced 模式）。
+  Future<void> _showMemberMemoryPicker(AppState state, ChatGroup g) async {
+    final c = await showModalBottomSheet<Character>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(12),
+              child: Text('选择要查看记忆的角色', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+            for (final m in _members.values)
+              ListTile(
+                leading: buildCharacterAvatar(context, m, 36),
+                title: Text(m.name),
+                onTap: () => Navigator.pop(ctx, m),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (c != null && mounted) {
+      await Navigator.push(context,
+          MaterialPageRoute(builder: (_) => MemoryScreen(characterId: c.id, memoryModeLabel: _memoryModeLabel(g.memoryMode))));
+      if (mounted) setState(() {});
+    }
+  }
+
+  String _memoryModeLabel(String mode) {
+    switch (mode) {
+      case 'separate':
+        return '记忆模式：角色独立全新记忆';
+      case 'synced':
+        return '记忆模式：角色独立同步记忆';
+      default:
+        return '记忆模式：全新整体记忆';
+    }
   }
 
   Future<void> _openMembers(AppState state) async {
@@ -565,9 +777,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
               if (v == 'settings') {
                 _showGroupChatSettings(state, g);
               } else if (v == 'memory') {
-                await Navigator.push(context,
-                    MaterialPageRoute(builder: (_) => MemoryScreen(characterId: 'group_${g.id}')));
-                if (mounted) setState(() {});
+                if (g.memoryMode == 'whole') {
+                  await Navigator.push(context,
+                      MaterialPageRoute(builder: (_) => MemoryScreen(characterId: 'group_${g.id}', memoryModeLabel: _memoryModeLabel(g.memoryMode))));
+                  if (mounted) setState(() {});
+                } else {
+                  _showMemberMemoryPicker(state, g);
+                }
+              } else if (v == 'search') {
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => SearchHistoryScreen(groupId: g.id)),
+                );
               } else if (v == 'worldbook') {
                 final r = await showWorldbookPicker(context, initial: g.worldbookIds);
                 if (r == null || !mounted) return;
@@ -588,6 +809,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'settings', child: Text('聊天窗口设置')),
               PopupMenuItem(value: 'memory', child: Text('长期记忆')),
+              PopupMenuItem(value: 'search', child: Text('查找聊天记录')),
               PopupMenuItem(value: 'worldbook', child: Text('世界书')),
               PopupMenuItem(value: 'edit', child: Text('编辑群聊')),
               PopupMenuItem(value: 'delete', child: Text('删除群聊')),
@@ -625,14 +847,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final showCharAvatar = _hideCharAvatar == null ? true : !_hideCharAvatar;
     final showUserAvatar = _hideUserAvatar == null ? true : !_hideUserAvatar;
     final last = _messages.isNotEmpty ? _messages.length - 1 : -1;
+    final showBanner = _searchReturnIndex >= 0;
+    final bannerOffset = showBanner ? 1 : 0;
     return ListView.builder(
       controller: _scroll,
       padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
-      itemCount: _messages.length + (_streaming ? 1 : 0),
+      itemCount: bannerOffset + _messages.length + (_streaming ? 1 : 0),
       itemBuilder: (context, i) {
-        if (i < _messages.length) {
-          final m = _messages[i];
-          final foot = (i == last && !_streaming) ? _actionFooter(state, m) : null;
+        if (showBanner && i == 0) return _searchReturnBanner();
+        final idx = i - bannerOffset;
+        if (idx < _messages.length) {
+          final m = _messages[idx];
+          final foot = (idx == last && !_streaming) ? _actionFooter(state, m) : null;
           if (m.role == 'user') {
             return MessageBubble(
               message: m,
@@ -643,6 +869,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
               footer: foot,
               bubbleColor: parseHexColor(state.settings.bubbleSelfColor),
               bubbleOpacity: state.settings.bubbleOpacity,
+              fontScale: state.settings.fontSize,
+              highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
+              onDeleteFromHere: () => _deleteFromHere(m),
             );
           }
           final sender = m.senderCharacterId != null ? _members[m.senderCharacterId] : null;
@@ -656,6 +885,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             topContent: m.reasoning.trim().isNotEmpty ? ThinkingToggle(reasoning: m.reasoning) : null,
             bubbleColor: parseHexColor(state.settings.bubbleCharColor),
             bubbleOpacity: state.settings.bubbleOpacity,
+            fontScale: state.settings.fontSize,
+            highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
+            onDeleteFromHere: () => _deleteFromHere(m),
           );
         }
         Character? sender;
@@ -676,8 +908,32 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           senderName: _streamSender,
           showAvatar: showCharAvatar,
           isCurrent: true,
+          fontScale: state.settings.fontSize,
         );
       },
+    );
+  }
+
+  Widget _searchReturnBanner() {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: scheme.primaryContainer.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.search, size: 18),
+          const SizedBox(width: 8),
+          const Expanded(child: Text('已定位到查找的消息', style: TextStyle(fontSize: 13))),
+          TextButton(
+            onPressed: () => setState(() => _searchReturnIndex = -1),
+            child: const Text('结束查找'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -825,37 +1081,51 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             ),
             const SizedBox(width: 6),
             Expanded(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 56),
-                child: TextField(
-                  controller: _input,
-                  minLines: 1,
-                  maxLines: 3,
-                  keyboardType: TextInputType.multiline,
-                  textInputAction: TextInputAction.newline,
-                  style: TextStyle(
-                      fontSize: 16,
-                      color: Theme.of(context).brightness == Brightness.dark ? Colors.white : Colors.black),
-                  decoration: InputDecoration(
-                    hintText: _generating ? '正在生成…' : '发一条消息…',
-                    filled: true,
-                    isDense: true,
-                    fillColor: Theme.of(context).brightness == Brightness.dark
-                        ? Colors.black.withValues(alpha: 0.45)
-                        : Colors.white.withValues(alpha: 0.6),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: BorderSide.none,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  AiRewriteButton(
+                    controller: _input,
+                    rewrite: _rewriteText,
+                    color: Theme.of(context).colorScheme.primary,
+                    fontSize: 10,
+                    onRewriting: (v) => setState(() => _inputRewriting = v),
                   ),
-                ),
+                  const SizedBox(height: 2),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 56),
+                    child: TextField(
+                      controller: _input,
+                      minLines: 1,
+                      maxLines: 3,
+                      keyboardType: TextInputType.multiline,
+                      textInputAction: TextInputAction.newline,
+                      style: TextStyle(
+                          fontSize: 16,
+                          color: Theme.of(context).brightness == Brightness.dark ? Colors.white : Colors.black),
+                      decoration: InputDecoration(
+                        hintText: _inputRewriting ? '正在改写…' : (_generating ? '正在生成…' : '发一条消息…'),
+                        filled: true,
+                        isDense: true,
+                        fillColor: Theme.of(context).brightness == Brightness.dark
+                            ? Colors.black.withValues(alpha: 0.45)
+                            : Colors.white.withValues(alpha: 0.6),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.send, size: 24),
-              onPressed: _streaming ? null : _send,
+              onPressed: (_streaming || _generating || _inputRewriting) ? null : _send,
               visualDensity: VisualDensity.compact,
             ),
           ],

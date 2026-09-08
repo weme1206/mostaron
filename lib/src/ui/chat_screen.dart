@@ -16,10 +16,13 @@ import 'memory_screen.dart';
 import 'character_editor_screen.dart';
 import 'worldbook_screen.dart';
 import 'worldbook_picker.dart';
+import 'widgets/search_history_screen.dart';
+import 'widgets/ai_rewrite_button.dart';
 
 class ChatScreen extends StatefulWidget {
   final String characterId;
-  const ChatScreen({super.key, required this.characterId});
+  final String? initialSearchTargetId; // 查找聊天记录后定位到某条消息
+  const ChatScreen({super.key, required this.characterId, this.initialSearchTargetId});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
@@ -45,6 +48,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool? _hideUserAvatar;
   bool _userScrolled = false;
   bool _programmaticJump = false;
+  int _searchReturnIndex = -1;
+  bool _inputRewriting = false;
 
   @override
   void initState() {
@@ -98,6 +103,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _loading = false;
     });
     _userScrolled = false;
+    if (widget.initialSearchTargetId != null) {
+      _jumpToMessage(widget.initialSearchTargetId!);
+    }
     for (final ms in const [0, 50, 200]) {
       Future.delayed(Duration(milliseconds: ms), () {
         if (mounted && !_userScrolled) _jumpToBottom(animate: false);
@@ -260,6 +268,29 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() => _messages.removeWhere((x) => x.id == m.id));
   }
 
+  /// 删除该消息及其之后的所有消息，并同步删除该角色产生的长记忆。
+  Future<void> _deleteFromHere(ChatMessage m) async {
+    final state = context.read<AppState>();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('删除从这里开始的消息'),
+        content: const Text('将删除这条消息及其之后的所有消息，并清除这些消息产生的长期记忆。确定？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('删除')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted || _session == null) return;
+    final idx = _messages.indexWhere((x) => x.id == m.id);
+    if (idx < 0) return;
+    await state.deleteMessagesFrom(_session!.id, null, m.createdAt,
+        memoryOwners: [widget.characterId]);
+    setState(() => _messages = _messages.sublist(0, idx));
+    _jumpToBottom(animate: false);
+  }
+
   Future<void> _editMessage(ChatMessage m, {bool isUser = false}) async {
     final ctrl = TextEditingController(text: m.content);
     final ok = await showDialog<bool>(
@@ -288,8 +319,77 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _regenerate() async {
+  /// 让角色继续接着上一条回复自然续写（不插入用户消息，角色自己生成新消息）。
+  Future<void> _continueReply() async {
     if (_streaming) return;
+    final state = context.read<AppState>();
+    final character = _character;
+    final provider = _resolveProvider(state);
+    if (character == null || provider == null) {
+      _toast('请先配置接口');
+      return;
+    }
+    final session = _session;
+    if (session == null) return;
+    // 构造续写 payload：历史 + 一条要求继续的 system 提示（不持久化用户消息）
+    final history = _messages.where((m) => m.role != 'system').toList();
+    final payload = PromptBuilder.buildMessages(
+      character: character,
+      eff: resolveCharacter(state.settings, character),
+      worldbook: _worldbook,
+      memories: _memories,
+      history: history,
+    );
+    payload.add({
+      'role': 'user',
+      'content': '请接着你上一句话继续说下去，自然续写，不要重复。',
+    });
+    final id = DateTime.now().microsecondsSinceEpoch.toString();
+    setState(() {
+      _streaming = true;
+      _streamText = '';
+      _streamReasoning = '';
+    });
+    _jumpToBottom();
+    try {
+      await for (final delta in ApiClient().streamChat(
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        model: (character.model?.isNotEmpty ?? false) ? character.model! : provider.model,
+        messages: payload,
+        temperature: 0.9,
+      )) {
+        if (!mounted) return;
+        setState(() {
+          if (delta.content.isNotEmpty) _streamText += delta.content;
+          if (delta.reasoning.isNotEmpty) _streamReasoning += delta.reasoning;
+        });
+        _jumpToBottom();
+      }
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _streamText += '\n[错误] ${e.message}');
+    }
+    final asst = ChatMessage(
+      id: id,
+      sessionId: session.id,
+      role: 'assistant',
+      content: _streamText.trim(),
+      reasoning: _streamReasoning.trim(),
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    await state.insertMessage(asst);
+    if (mounted) {
+      setState(() {
+        _messages.add(asst);
+        _streaming = false;
+        _streamText = '';
+      });
+      _showReasoning = false;
+    }
+    await _autoMemory(state);
+  }
+
+  Future<void> _regenerate() async {
     final state = context.read<AppState>();
     final provider = _resolveProvider(state);
     if (provider == null) {
@@ -364,6 +464,26 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// 润色一句话，用于输入框的 AI 改写按钮。
+  Future<String> _rewriteText(String text) async {
+    final state = context.read<AppState>();
+    final provider = _resolveProvider(state);
+    if (provider == null) {
+      _toast('请先配置接口');
+      return text;
+    }
+    final result = await ApiClient().completeChat(
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      model: (_character!.model?.isNotEmpty ?? false) ? _character!.model! : provider.model,
+      messages: [
+        {'role': 'system', 'content': '把下面这句话润色成更自然的角色扮演输入，保留原意，直接输出。'},
+        {'role': 'user', 'content': text},
+      ],
+    );
+    return result.trim();
+  }
+
   Future<void> _rewriteUserMessage(ChatMessage m) async {
     final state = context.read<AppState>();
     final provider = _resolveProvider(state);
@@ -387,9 +507,10 @@ class _ChatScreenState extends State<ChatScreen> {
       )).trim();
       if (mounted) {
         setState(() {
-          _input.text = text;
           _generating = false;
         });
+        // 改写后替换原消息并触发角色自动回复
+        await _replaceUserAndReply(state, m, text);
       }
     } catch (e) {
       if (mounted) {
@@ -397,6 +518,16 @@ class _ChatScreenState extends State<ChatScreen> {
         _toast('改写失败: $e');
       }
     }
+  }
+
+  /// 把某条用户消息替换为新内容，并让角色自动回复。
+  Future<void> _replaceUserAndReply(AppState state, ChatMessage m, String text) async {
+    await state.updateMessageContent(m.id, text);
+    setState(() {
+      final idx = _messages.indexWhere((x) => x.id == m.id);
+      if (idx >= 0) _messages[idx] = _messages[idx].copyWith(content: text);
+    });
+    await _streamReply(state);
   }
 
   Future<void> _copy(ChatMessage m) async {
@@ -443,6 +574,23 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  /// 查找聊天记录后跳转到某条消息，并高亮它；顶部显示"返回查找结果"条。
+  void _jumpToMessage(String id) {
+    final idx = _messages.indexWhere((m) => m.id == id);
+    if (idx < 0 || !mounted) return;
+    setState(() => _searchReturnIndex = idx);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      _programmaticJump = true;
+      final target = _messages.length == 0
+          ? 0.0
+          : (_scroll.position.maxScrollExtent * (idx / _messages.length))
+              .clamp(0.0, _scroll.position.maxScrollExtent);
+      _scroll.animateTo(target, duration: const Duration(milliseconds: 350), curve: Curves.easeOut);
+      _programmaticJump = false;
+    });
+  }
+
   Future<void> _openChatMenu(AppState state) async {
     final character = _character;
     if (character == null) return;
@@ -455,6 +603,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ListTile(leading: const Icon(Icons.edit), title: const Text('角色设置'), onTap: () => Navigator.pop(ctx, 'char')),
             ListTile(leading: const Icon(Icons.tune), title: const Text('聊天窗口设置'), onTap: () => Navigator.pop(ctx, 'settings')),
             ListTile(leading: const Icon(Icons.psychology), title: const Text('长期记忆'), onTap: () => Navigator.pop(ctx, 'memory')),
+            ListTile(leading: const Icon(Icons.search), title: const Text('查找聊天记录'), onTap: () => Navigator.pop(ctx, 'search')),
             ListTile(leading: const Icon(Icons.history), title: const Text('删除当前对话'), onTap: () => Navigator.pop(ctx, 'clear')),
             ListTile(leading: const Icon(Icons.menu_book), title: const Text('选择世界书'), onTap: () => Navigator.pop(ctx, 'worldbook')),
           ],
@@ -474,6 +623,12 @@ class _ChatScreenState extends State<ChatScreen> {
         await Navigator.push(context, MaterialPageRoute(builder: (_) => MemoryScreen(characterId: character.id)));
         final ms = await state.memoriesFor(character.id);
         if (mounted) setState(() => _memories = ms);
+        break;
+      case 'search':
+        await Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => SearchHistoryScreen(characterId: character.id)),
+        );
         break;
       case 'worldbook':
         {
@@ -608,14 +763,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _messageList(AppState state, Character c, bool showCharAvatar, bool showUserAvatar, double topInset) {
+    final showBanner = _searchReturnIndex >= 0;
+    final bannerOffset = showBanner ? 1 : 0;
     return ListView.builder(
       controller: _scroll,
       padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
-      itemCount: _messages.length + (_streaming ? 1 : 0),
+      itemCount: bannerOffset + _messages.length + (_streaming ? 1 : 0),
       itemBuilder: (context, i) {
-        if (i < _messages.length) {
-          final m = _messages[i];
-          final isLast = i == _messages.length - 1;
+        if (showBanner && i == 0) {
+          return _searchReturnBanner();
+        }
+        final msgIdx = i - bannerOffset;
+        if (msgIdx < _messages.length) {
+          final m = _messages[msgIdx];
+          final isLast = msgIdx == _messages.length - 1;
           final reasoning = (m.role == 'assistant' && m.reasoning.isNotEmpty) ? m.reasoning : '';
           return MessageBubble(
             message: m,
@@ -631,8 +792,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? parseHexColor(state.settings.bubbleSelfColor)
                 : parseHexColor(state.settings.bubbleCharColor),
             bubbleOpacity: state.settings.bubbleOpacity,
+            fontScale: state.settings.fontSize,
+            highlight: _searchReturnIndex >= 0 && msgIdx == _searchReturnIndex,
             onCopy: () => _copy(m),
             onDelete: () => _deleteMessage(m),
+            onDeleteFromHere: () => _deleteFromHere(m),
           );
         }
         final streamingMsg = ChatMessage(
@@ -660,10 +824,34 @@ class _ChatScreenState extends State<ChatScreen> {
               senderName: c.name,
               showAvatar: showCharAvatar,
               isCurrent: true,
+              fontScale: state.settings.fontSize,
             ),
           ],
         );
       },
+    );
+  }
+
+  Widget _searchReturnBanner() {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: scheme.primaryContainer.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.search, size: 18),
+          const SizedBox(width: 8),
+          const Expanded(child: Text('已定位到查找的消息', style: TextStyle(fontSize: 13))),
+          TextButton(
+            onPressed: () => setState(() => _searchReturnIndex = -1),
+            child: const Text('结束查找'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -701,13 +889,13 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /// 最新一轮消息下方的操作条（透明圆角）
+  /// 最新一轮消息下方的操作条（透明圆角，纯图标）
   Widget _actionFooter(AppState state, ChatMessage m) {
     final scheme = Theme.of(context).colorScheme;
     return IgnorePointer(
       ignoring: _generating || _streaming,
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
         decoration: BoxDecoration(
         color: Theme.of(context).brightness == Brightness.dark
             ? Colors.black.withValues(alpha: 0.35)
@@ -716,33 +904,31 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       child: m.role == 'user'
           ? Row(mainAxisSize: MainAxisSize.min, children: [
-              _btn(scheme, Icons.delete_outline, '删除', () => _deleteMessage(m)),
-              _btn(scheme, Icons.edit, '编辑', () => _editMessage(m, isUser: true)),
-              _btn(scheme, Icons.auto_awesome, 'AI改写', () => _rewriteUserMessage(m)),
+              _btn(scheme, Icons.delete_outline, () => _deleteMessage(m)),
+              _btn(scheme, Icons.edit, () => _editMessage(m, isUser: true)),
+              _btn(scheme, _continueIcon, () => _continueReply()),
+              _btn(scheme, Icons.auto_awesome, () => _rewriteUserMessage(m)),
             ])
           : Row(mainAxisSize: MainAxisSize.min, children: [
-              _btn(scheme, Icons.refresh, '重生成', () => _regenerate()),
-              _btn(scheme, Icons.delete_outline, '删除', () => _deleteMessage(m)),
-              _btn(scheme, Icons.edit, '编辑', () => _editMessage(m)),
-              _btn(scheme, Icons.chat_bubble_outline, '生成我的回复', () => _generateUserMessage()),
+              _btn(scheme, Icons.refresh, () => _regenerate()),
+              _btn(scheme, Icons.delete_outline, () => _deleteMessage(m)),
+              _btn(scheme, Icons.edit, () => _editMessage(m)),
+              _btn(scheme, _continueIcon, () => _continueReply()),
+              _btn(scheme, Icons.chat_bubble_outline, () => _generateUserMessage()),
             ]),
       ),
     );
   }
 
-  Widget _btn(ColorScheme scheme, IconData icon, String label, VoidCallback onTap) {
+  static const IconData _continueIcon = Icons.arrow_forward_ios;
+
+  Widget _btn(ColorScheme scheme, IconData icon, VoidCallback onTap) {
     return InkWell(
       onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 14, color: scheme.primary),
-            const SizedBox(width: 2),
-            Text(label, style: TextStyle(fontSize: 11, color: scheme.primary)),
-          ],
-        ),
+        padding: const EdgeInsets.all(7),
+        child: Icon(icon, size: 19, color: scheme.primary),
       ),
     );
   }
@@ -767,35 +953,49 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             const SizedBox(width: 6),
             Expanded(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 56),
-                child: TextField(
-                  controller: _input,
-                  minLines: 1,
-                  maxLines: 3,
-                  keyboardType: TextInputType.multiline,
-                  textInputAction: TextInputAction.newline,
-                  style: const TextStyle(fontSize: 16),
-                  decoration: InputDecoration(
-                    hintText: _generating ? '正在生成…' : '发一条消息…',
-                    filled: true,
-                    isDense: true,
-                    fillColor: Theme.of(context).brightness == Brightness.dark
-                        ? Colors.black.withValues(alpha: 0.45)
-                        : Colors.white.withValues(alpha: 0.6),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(20),
-                      borderSide: BorderSide.none,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  AiRewriteButton(
+                    controller: _input,
+                    rewrite: _rewriteText,
+                    color: Theme.of(context).colorScheme.primary,
+                    fontSize: 10,
+                    onRewriting: (v) => setState(() => _inputRewriting = v),
                   ),
-                ),
+                  const SizedBox(height: 2),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 56),
+                    child: TextField(
+                      controller: _input,
+                      minLines: 1,
+                      maxLines: 3,
+                      keyboardType: TextInputType.multiline,
+                      textInputAction: TextInputAction.newline,
+                      style: const TextStyle(fontSize: 16),
+                      decoration: InputDecoration(
+                        hintText: _inputRewriting ? '正在改写…' : (_generating ? '正在生成…' : '发一条消息…'),
+                        filled: true,
+                        isDense: true,
+                        fillColor: Theme.of(context).brightness == Brightness.dark
+                            ? Colors.black.withValues(alpha: 0.45)
+                            : Colors.white.withValues(alpha: 0.6),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(width: 4),
             IconButton(
               icon: const Icon(Icons.send, size: 24),
-              onPressed: _streaming ? null : _send,
+              onPressed: (_streaming || _generating || _inputRewriting) ? null : _send,
               visualDensity: VisualDensity.compact,
             ),
           ],

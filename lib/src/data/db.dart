@@ -19,7 +19,7 @@ class AppDatabase {
     final path = p.join(dir, 'mostaron.db');
     return openDatabase(
       path,
-      version: 7,
+      version: 8,
       onCreate: (db, v) async {
         await _createTables(db);
       },
@@ -41,7 +41,11 @@ class AppDatabase {
         chat_background TEXT, provider_id TEXT, model TEXT,
         reply_style TEXT, worldbook_ids TEXT, settings_json TEXT,
         user_name TEXT, user_gender TEXT, user_relation TEXT, user_background TEXT,
-        pinned INTEGER, last_activity INTEGER, created_at INTEGER
+        pinned INTEGER, last_activity INTEGER,
+        scenario TEXT, example_dialogue TEXT, creator_notes TEXT,
+        system_prompt TEXT, post_history_instructions TEXT, alt_greetings TEXT,
+        tags TEXT, creator TEXT, character_version TEXT, extensions TEXT,
+        created_at INTEGER
       )
     ''');
     await db.execute('''
@@ -63,7 +67,7 @@ class AppDatabase {
         user_name TEXT, user_gender TEXT, user_relation TEXT, user_background TEXT,
         pinned INTEGER, provider_id TEXT, model TEXT, reply_style TEXT,
         auto_memory_every INTEGER, last_activity INTEGER, worldbook_ids TEXT,
-        created_at INTEGER, updated_at INTEGER
+        memory_mode TEXT, created_at INTEGER, updated_at INTEGER
       )
     ''');
     await db.execute('''
@@ -178,6 +182,20 @@ class AppDatabase {
         await db.delete('worldbook', where: 'character_id IS NOT NULL');
       } catch (_) {}
     }
+    if (oldV < 8) {
+      for (final col in [
+        'scenario TEXT', 'example_dialogue TEXT', 'creator_notes TEXT',
+        'system_prompt TEXT', 'post_history_instructions TEXT', 'alt_greetings TEXT',
+        'tags TEXT', 'creator TEXT', 'character_version TEXT', 'extensions TEXT',
+      ]) {
+        try {
+          await db.execute('ALTER TABLE characters ADD COLUMN $col');
+        } catch (_) {}
+      }
+      try {
+        await db.execute('ALTER TABLE groups ADD COLUMN memory_mode TEXT');
+      } catch (_) {}
+    }
   }
 
   Future<void> saveSettings(AppSettings s) async {
@@ -247,6 +265,83 @@ class AppDatabase {
   Future<void> upsertCharacter(Character c) async {
     final d = await db;
     await d.insert('characters', c.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// 完整克隆角色：拷贝角色 + 会话 + 消息 + 记忆（复制到新 id，名字加"副本"）。
+  Future<void> cloneCharacterFull(Character c, String newId, bool includeHistory) async {
+    final d = await db;
+    await d.transaction((txn) async {
+      await txn.insert('characters', c.copyWith(id: newId, name: '${c.name} 副本', lastActivity: DateTime.now().millisecondsSinceEpoch).toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      if (!includeHistory) return;
+      final sessions = await txn.query('sessions', where: 'character_id = ?', whereArgs: [c.id]);
+      for (final s in sessions) {
+        final nid = '${newId}_${s['id']}';
+        await txn.insert('sessions', {
+          'id': nid,
+          'character_id': newId,
+          'title': s['title'],
+          'created_at': s['created_at'],
+          'updated_at': s['updated_at'],
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+        final msgs = await txn.query('messages', where: 'session_id = ?', whereArgs: [s['id']]);
+        for (final m in msgs) {
+          await txn.insert('messages', {
+            'id': '${nid}_${m['id']}',
+            'session_id': nid,
+            'group_id': m['group_id'],
+            'role': m['role'],
+            'content': m['content'],
+            'reasoning': m['reasoning'],
+            'sender_id': m['sender_id'],
+            'created_at': m['created_at'],
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        }
+      }
+      final mems = await txn.query('memories', where: 'character_id = ?', whereArgs: [c.id]);
+      for (final m in mems) {
+        await txn.insert('memories', {
+          'id': '${newId}_${m['id']}',
+          'character_id': newId,
+          'content': m['content'],
+          'pinned': m['pinned'],
+          'created_at': m['created_at'],
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+    });
+  }
+
+  /// 完整克隆群聊：拷贝群 + 消息 + 群记忆（复制到新 id）。
+  Future<void> cloneGroupFull(ChatGroup g, String newId, bool includeHistory) async {
+    final d = await db;
+    await d.transaction((txn) async {
+      await txn.insert('groups', g.copyWith(id: newId, name: '${g.name} 副本', lastActivity: DateTime.now().millisecondsSinceEpoch).toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace);
+      if (!includeHistory) return;
+      final msgs = await txn.query('messages', where: 'group_id = ?', whereArgs: [g.id]);
+      for (final m in msgs) {
+        await txn.insert('messages', {
+          'id': '${newId}_${m['id']}',
+          'session_id': m['session_id'],
+          'group_id': newId,
+          'role': m['role'],
+          'content': m['content'],
+          'reasoning': m['reasoning'],
+          'sender_id': m['sender_id'],
+          'created_at': m['created_at'],
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      final mems = await txn.query('memories', where: 'character_id = ?', whereArgs: ['group_${g.id}']);
+      for (final m in mems) {
+        await txn.insert('memories', {
+          'id': '${newId}_${m['id']}',
+          'character_id': 'group_$newId',
+          'content': m['content'],
+          'pinned': m['pinned'],
+          'created_at': m['created_at'],
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+    });
   }
 
   Future<void> deleteCharacter(String id) async {
@@ -350,9 +445,50 @@ class AppDatabase {
     return rows.isEmpty ? '' : (rows.first['content'] as String? ?? '');
   }
 
+  /// 某角色最近一条消息的创建时间（ms），无则 0
+  Future<int> lastMessageTimeForCharacter(String characterId) async {
+    final d = await db;
+    final rows = await d.rawQuery('''
+      SELECT created_at FROM messages
+      WHERE session_id IN (SELECT id FROM sessions WHERE character_id = ?)
+      ORDER BY created_at DESC LIMIT 1
+    ''', [characterId]);
+    return rows.isEmpty ? 0 : (rows.first['created_at'] as int? ?? 0);
+  }
+
+  /// 某群聊最近一条消息的创建时间（ms），无则 0
+  Future<int> lastMessageTimeForGroup(String groupId) async {
+    final d = await db;
+    final rows = await d.rawQuery(
+        'SELECT created_at FROM messages WHERE group_id = ? ORDER BY created_at DESC LIMIT 1', [groupId]);
+    return rows.isEmpty ? 0 : (rows.first['created_at'] as int? ?? 0);
+  }
+
   Future<void> deleteMessage(String id) async {
     final d = await db;
     await d.delete('messages', where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 删除某会话/群聊中 created_at 之后（含）的所有消息，返回被删条数。
+  Future<int> deleteMessagesFrom(String? sessionId, String? groupId, int cutoff) async {
+    final d = await db;
+    final t = await d.transaction((txn) async {
+      final n = await txn.delete(
+        'messages',
+        where: sessionId != null
+            ? 'session_id = ? AND created_at >= ?'
+            : 'group_id = ? AND created_at >= ?',
+        whereArgs: sessionId != null ? [sessionId, cutoff] : [groupId, cutoff],
+      );
+      return n;
+    });
+    return t;
+  }
+
+  /// 删除某用户（角色/群标识）下所有记忆。
+  Future<void> deleteMemoriesFor(String ownerId) async {
+    final d = await db;
+    await d.delete('memories', where: 'character_id = ?', whereArgs: [ownerId]);
   }
 
   Future<void> _touch(Database d, String table, String id) async {

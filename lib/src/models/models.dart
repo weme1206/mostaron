@@ -85,6 +85,18 @@ class Character {
   int lastActivity;
   final int createdAt;
 
+  // ---- SillyTavern 角色卡扩展字段 ----
+  String scenario; // 场景
+  String exampleDialogue; // 示例对话 mes_example
+  String creatorNotes; // 作者注释
+  String systemPrompt; // 系统提示
+  String postHistoryInstructions; // 历史后置指令
+  List<String> alternateGreetings; // 备选开场白
+  List<String> tags; // 标签
+  String creator;
+  String characterVersion;
+  Map<String, dynamic> extensions; // 扩展字段（保留原样）
+
   Character({
     required this.id,
     required this.name,
@@ -107,6 +119,16 @@ class Character {
     this.pinned = false,
     this.lastActivity = 0,
     this.createdAt = 0,
+    this.scenario = '',
+    this.exampleDialogue = '',
+    this.creatorNotes = '',
+    this.systemPrompt = '',
+    this.postHistoryInstructions = '',
+    this.alternateGreetings = const [],
+    this.tags = const [],
+    this.creator = '',
+    this.characterVersion = '',
+    this.extensions = const {},
   });
 
   Map<String, dynamic> toMap() => {
@@ -131,6 +153,16 @@ class Character {
         'pinned': pinned ? 1 : 0,
         'last_activity': lastActivity,
         'created_at': createdAt,
+        'scenario': scenario,
+        'example_dialogue': exampleDialogue,
+        'creator_notes': creatorNotes,
+        'system_prompt': systemPrompt,
+        'post_history_instructions': postHistoryInstructions,
+        'alt_greetings': jsonEncode(alternateGreetings),
+        'tags': jsonEncode(tags),
+        'creator': creator,
+        'character_version': characterVersion,
+        'extensions': jsonEncode(extensions),
       };
 
   factory Character.fromMap(Map<String, dynamic> m) => Character(
@@ -155,9 +187,20 @@ class Character {
         pinned: (m['pinned'] as int? ?? 0) == 1,
         lastActivity: m['last_activity'] as int? ?? 0,
         createdAt: m['created_at'] as int? ?? 0,
+        scenario: m['scenario'] as String? ?? '',
+        exampleDialogue: m['example_dialogue'] as String? ?? '',
+        creatorNotes: m['creator_notes'] as String? ?? '',
+        systemPrompt: m['system_prompt'] as String? ?? '',
+        postHistoryInstructions: m['post_history_instructions'] as String? ?? '',
+        alternateGreetings: _decodeList(m['alt_greetings']),
+        tags: _decodeList(m['tags']),
+        creator: m['creator'] as String? ?? '',
+        characterVersion: m['character_version'] as String? ?? '',
+        extensions: _decodeMap(m['extensions']),
       );
 
   Character copyWith({
+    String? id,
     String? name,
     String? avatar,
     String? persona,
@@ -177,9 +220,19 @@ class Character {
     String? userBackground,
     bool? pinned,
     int? lastActivity,
+    String? scenario,
+    String? exampleDialogue,
+    String? creatorNotes,
+    String? systemPrompt,
+    String? postHistoryInstructions,
+    List<String>? alternateGreetings,
+    List<String>? tags,
+    String? creator,
+    String? characterVersion,
+    Map<String, dynamic>? extensions,
   }) =>
       Character(
-        id: id,
+        id: id ?? this.id,
         name: name ?? this.name,
         avatar: avatar ?? this.avatar,
         persona: persona ?? this.persona,
@@ -199,6 +252,16 @@ class Character {
         userBackground: userBackground ?? this.userBackground,
         pinned: pinned ?? this.pinned,
         lastActivity: lastActivity ?? this.lastActivity,
+        scenario: scenario ?? this.scenario,
+        exampleDialogue: exampleDialogue ?? this.exampleDialogue,
+        creatorNotes: creatorNotes ?? this.creatorNotes,
+        systemPrompt: systemPrompt ?? this.systemPrompt,
+        postHistoryInstructions: postHistoryInstructions ?? this.postHistoryInstructions,
+        alternateGreetings: alternateGreetings ?? this.alternateGreetings,
+        tags: tags ?? this.tags,
+        creator: creator ?? this.creator,
+        characterVersion: characterVersion ?? this.characterVersion,
+        extensions: extensions ?? this.extensions,
         createdAt: createdAt,
       );
 }
@@ -339,6 +402,7 @@ class ChatGroup {
   int autoMemoryEvery;
   int lastActivity;
   List<String> worldbookIds;
+  String memoryMode; // whole / separate / synced
   final int createdAt;
   int updatedAt;
 
@@ -361,6 +425,7 @@ class ChatGroup {
     this.autoMemoryEvery = 0,
     this.lastActivity = 0,
     this.worldbookIds = const [],
+    this.memoryMode = 'whole',
     this.createdAt = 0,
     this.updatedAt = 0,
   });
@@ -384,6 +449,7 @@ class ChatGroup {
         'auto_memory_every': autoMemoryEvery,
         'last_activity': lastActivity,
         'worldbook_ids': jsonEncode(worldbookIds),
+        'memory_mode': memoryMode,
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
@@ -407,11 +473,13 @@ class ChatGroup {
         autoMemoryEvery: m['auto_memory_every'] as int? ?? 0,
         lastActivity: m['last_activity'] as int? ?? 0,
         worldbookIds: _decodeList(m['worldbook_ids']),
+        memoryMode: m['memory_mode'] as String? ?? 'whole',
         createdAt: m['created_at'] as int? ?? 0,
         updatedAt: m['updated_at'] as int? ?? 0,
       );
 
   ChatGroup copyWith({
+    String? id,
     String? name,
     String? avatar,
     String? background,
@@ -429,9 +497,10 @@ class ChatGroup {
     int? autoMemoryEvery,
     int? lastActivity,
     List<String>? worldbookIds,
+    String? memoryMode,
   }) =>
       ChatGroup(
-        id: id,
+        id: id ?? this.id,
         name: name ?? this.name,
         avatar: avatar ?? this.avatar,
         background: background ?? this.background,
@@ -449,6 +518,7 @@ class ChatGroup {
         autoMemoryEvery: autoMemoryEvery ?? this.autoMemoryEvery,
         lastActivity: lastActivity ?? this.lastActivity,
         worldbookIds: worldbookIds ?? this.worldbookIds,
+        memoryMode: memoryMode ?? this.memoryMode,
         createdAt: createdAt,
         updatedAt: updatedAt,
       );
@@ -583,6 +653,7 @@ class AppSettings {
   String bubbleSelfColor; // 我的气泡颜色 hex
   String bubbleCharColor; // 角色气泡颜色 hex
   double bubbleOpacity; // 气泡透明度 0.4~1.0
+  double fontSize; // 全局字体大小倍率
 
   AppSettings({
     this.defaultProviderId = '',
@@ -610,6 +681,7 @@ class AppSettings {
     this.bubbleSelfColor = '',
     this.bubbleCharColor = '',
     this.bubbleOpacity = 1.0,
+    this.fontSize = 1.0,
   });
 
   Map<String, dynamic> toMap() => {
@@ -638,6 +710,7 @@ class AppSettings {
         'bubble_self_color': bubbleSelfColor,
         'bubble_char_color': bubbleCharColor,
         'bubble_opacity': bubbleOpacity,
+        'font_size': fontSize,
       };
 
   factory AppSettings.fromMap(Map<String, dynamic> m) => AppSettings(
@@ -666,6 +739,7 @@ class AppSettings {
         bubbleSelfColor: m['bubble_self_color'] as String? ?? '',
         bubbleCharColor: m['bubble_char_color'] as String? ?? '',
         bubbleOpacity: (m['bubble_opacity'] as num? ?? 1.0).toDouble(),
+        fontSize: (m['font_size'] as num? ?? 1.0).toDouble(),
       );
 
   AppSettings copyWith({
@@ -694,6 +768,7 @@ class AppSettings {
     String? bubbleSelfColor,
     String? bubbleCharColor,
     double? bubbleOpacity,
+    double? fontSize,
   }) =>
       AppSettings(
         defaultProviderId: defaultProviderId ?? this.defaultProviderId,
@@ -721,5 +796,6 @@ class AppSettings {
         bubbleSelfColor: bubbleSelfColor ?? this.bubbleSelfColor,
         bubbleCharColor: bubbleCharColor ?? this.bubbleCharColor,
         bubbleOpacity: bubbleOpacity ?? this.bubbleOpacity,
+        fontSize: fontSize ?? this.fontSize,
       );
 }

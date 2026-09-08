@@ -7,6 +7,7 @@ import '../models/models.dart';
 import '../services/api_client.dart';
 import '../state/app_state.dart';
 import 'widgets/preset_avatar.dart';
+import 'widgets/tag_editors.dart';
 import 'worldbook_screen.dart';
 import 'worldbook_picker.dart';
 import 'avatar_crop_screen.dart';
@@ -28,7 +29,16 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
   late TextEditingController _background;
   late TextEditingController _greeting;
   late TextEditingController _chatBg;
+  late TextEditingController _scenario;
+  late TextEditingController _exampleDialogue;
+  late TextEditingController _creatorNotes;
+  late TextEditingController _systemPrompt;
+  late TextEditingController _postHistory;
+  late TextEditingController _creator;
+  late TextEditingController _charVersion;
   late TextEditingController _genText;
+  List<String> _altGreetings = [];
+  List<String> _tags = [];
   late TextEditingController _model;
   late TextEditingController _uname;
   late TextEditingController _ugender;
@@ -64,7 +74,16 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
     _background = TextEditingController(text: c?.background ?? '');
     _greeting = TextEditingController(text: c?.greeting ?? '');
     _chatBg = TextEditingController(text: c?.chatBackground ?? '');
+    _scenario = TextEditingController(text: c?.scenario ?? '');
+    _exampleDialogue = TextEditingController(text: c?.exampleDialogue ?? '');
+    _creatorNotes = TextEditingController(text: c?.creatorNotes ?? '');
+    _systemPrompt = TextEditingController(text: c?.systemPrompt ?? '');
+    _postHistory = TextEditingController(text: c?.postHistoryInstructions ?? '');
+    _creator = TextEditingController(text: c?.creator ?? '');
+    _charVersion = TextEditingController(text: c?.characterVersion ?? '');
     _genText = TextEditingController();
+    _altGreetings = List.of(c?.alternateGreetings ?? []);
+    _tags = List.of(c?.tags ?? []);
     _model = TextEditingController(text: c?.model ?? '');
     _replyStyle = c?.replyStyle ?? 'default';
     _avatar = c?.avatar ?? '';
@@ -87,7 +106,7 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
 
   @override
   void dispose() {
-    for (final t in [_name, _persona, _personality, _tone, _background, _greeting, _chatBg, _genText, _model, _uname, _ugender, _urelation, _ubg]) {
+    for (final t in [_name, _persona, _personality, _tone, _background, _greeting, _chatBg, _scenario, _exampleDialogue, _creatorNotes, _systemPrompt, _postHistory, _creator, _charVersion, _genText, _model, _uname, _ugender, _urelation, _ubg]) {
       t.dispose();
     }
     super.dispose();
@@ -115,11 +134,13 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
       'tone': _tone.text,
       'background': _background.text,
       'greeting': _greeting.text,
+      'scenario': _scenario.text,
+      'exampleDialogue': _exampleDialogue.text,
     };
     setState(() => _busy = true);
     try {
       final prompt =
-          '你是角色卡生成器。根据描述生成一个角色，严格返回 JSON（不要多余文字），字段：name, persona, personality, tone, background, greeting(开场白,一句话)。\n描述：$desc\n仅返回 JSON。';
+          '你是角色卡生成器。根据描述生成一个角色，严格返回 JSON（不要多余文字），字段：name, persona, personality, tone, background, greeting(开场白,一句话), scenario(场景设定), exampleDialogue(示例对话,一段角色扮演对话示例)。\n描述：$desc\n仅返回 JSON。';
       final reply = await ApiClient().completeChat(
         baseUrl: p.baseUrl,
         apiKey: p.apiKey,
@@ -138,6 +159,8 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
           _tone.text = obj['tone']?.toString() ?? '';
           _background.text = obj['background']?.toString() ?? '';
           _greeting.text = obj['greeting']?.toString() ?? '';
+          _scenario.text = obj['scenario']?.toString() ?? '';
+          _exampleDialogue.text = obj['exampleDialogue']?.toString() ?? '';
           _canUndo = true;
         });
       }
@@ -156,6 +179,8 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
       _tone.text = _beforeGen['tone'] ?? '';
       _background.text = _beforeGen['background'] ?? '';
       _greeting.text = _beforeGen['greeting'] ?? '';
+      _scenario.text = _beforeGen['scenario'] ?? '';
+      _exampleDialogue.text = _beforeGen['exampleDialogue'] ?? '';
       _canUndo = false;
     });
   }
@@ -204,6 +229,15 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
       background: _background.text.trim(),
       greeting: _greeting.text.trim(),
       chatBackground: _chatBg.text.trim(),
+      scenario: _scenario.text.trim(),
+      exampleDialogue: _exampleDialogue.text.trim(),
+      creatorNotes: _creatorNotes.text.trim(),
+      systemPrompt: _systemPrompt.text.trim(),
+      postHistoryInstructions: _postHistory.text.trim(),
+      alternateGreetings: _altGreetings,
+      tags: _tags,
+      creator: _creator.text.trim(),
+      characterVersion: _charVersion.text.trim(),
       providerId: _providerId.isEmpty ? null : _providerId,
       model: _model.text.trim().isEmpty ? null : _model.text.trim(),
       replyStyle: _replyStyle,
@@ -287,6 +321,8 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
           _field(_tone, '语气', maxLines: 2),
           _field(_background, '背景故事', maxLines: 4),
           _field(_greeting, '开场白（进入时显示）', maxLines: 2),
+          _field(_scenario, '场景（SillyTavern scenario）', maxLines: 3),
+          _field(_exampleDialogue, '示例对话（SillyTavern mes_example）', maxLines: 4),
           // 自定义聊天背景（上传图片）
           Card(
             child: ListTile(
@@ -487,6 +523,34 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
                       Text('$_charAutoEvery条'),
                     ],
                   ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          // SillyTavern 扩展字段
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: ExpansionTile(
+              leading: const Icon(Icons.description),
+              title: const Text('角色卡扩展字段', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('作者注释 / 系统提示 / 备选开场白 / 标签等'),
+              childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              children: [
+                _field(_creatorNotes, '作者注释 (creator_notes)', maxLines: 3, pad: false),
+                _field(_systemPrompt, '系统提示 (system_prompt)', maxLines: 3),
+                _field(_postHistory, '历史后置指令 (post_history_instructions)', maxLines: 3),
+                _field(_creator, '作者 (creator)', maxLines: 1),
+                _field(_charVersion, '角色版本 (character_version)', maxLines: 1),
+                TagEditors(
+                  values: _tags,
+                  label: '标签 (tags)',
+                  onChange: (v) => setState(() => _tags = v),
+                ),
+                TagEditors(
+                  values: _altGreetings,
+                  label: '备选开场白 (alternate_greetings)',
+                  onChange: (v) => setState(() => _altGreetings = v),
+                ),
               ],
             ),
           ),

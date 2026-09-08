@@ -614,6 +614,22 @@ class _ChatSettingsSectionState extends State<_ChatSettingsSection> {
               value: s.outputThinking,
               onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(outputThinking: v)),
             ),
+            Row(
+              children: [
+                const Text('字体大小'),
+                const Spacer(),
+                SizedBox(
+                  width: 140,
+                  child: Slider(
+                    value: s.fontSize.clamp(0.8, 1.4),
+                    min: 0.8, max: 1.4, divisions: 12,
+                    label: '${(s.fontSize * 100).round()}%',
+                    onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(fontSize: v)),
+                  ),
+                ),
+                Text('${(s.fontSize * 100).round()}%'),
+              ],
+            ),
           ],
         ),
       ),

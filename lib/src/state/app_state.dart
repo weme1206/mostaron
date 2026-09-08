@@ -3,6 +3,7 @@ import '../data/db.dart';
 import '../models/models.dart';
 import '../services/export_service.dart';
 import '../services/settings_resolver.dart';
+import '../services/character_card_service.dart';
 
 class AppState extends ChangeNotifier {
   final AppDatabase _db = AppDatabase.instance;
@@ -15,6 +16,9 @@ class AppState extends ChangeNotifier {
   // 每个角色/群聊的最新消息（用于主页卡片副标题）
   Map<String, String> lastCharMsg = {};
   Map<String, String> lastGroupMsg = {};
+  // 每个角色/群聊的最新消息时间（ms）
+  Map<String, int> lastCharTime = {};
+  Map<String, int> lastGroupTime = {};
 
   bool initialized = false;
 
@@ -31,12 +35,16 @@ class AppState extends ChangeNotifier {
 
   Future<void> _refreshLastMessages() async {
     lastCharMsg.clear();
+    lastCharTime.clear();
     for (final c in characters) {
       lastCharMsg[c.id] = await _db.lastMessageForCharacter(c.id);
+      lastCharTime[c.id] = await _db.lastMessageTimeForCharacter(c.id);
     }
     lastGroupMsg.clear();
+    lastGroupTime.clear();
     for (final g in groups) {
       lastGroupMsg[g.id] = await _db.lastMessageForGroup(g.id);
+      lastGroupTime[g.id] = await _db.lastMessageTimeForGroup(g.id);
     }
   }
 
@@ -93,6 +101,30 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 导入 SillyTavern 角色卡，创建为新角色；若带世界书则加入全局世界书库。
+  /// [avatarPath]：若为图片角色卡，用该图片作为头像。
+  /// 返回新建角色（失败返回 null）。
+  Future<Character?> importCharacterCard(Uint8List bytes, {String? avatarPath}) async {
+    final card = CharacterCardService.parseBytes(bytes);
+    if (card == null) return null;
+    final id = _uid();
+    final c = CharacterCardService.toCharacter(card, id);
+    // 图片角色卡：用图片本身作为头像
+    if (avatarPath != null && avatarPath.isNotEmpty) {
+      c.avatar = avatarPath;
+    }
+    await _db.upsertCharacter(c);
+    if (card.worldbook.isNotEmpty) {
+      for (final w in card.worldbook) {
+        await _db.upsertWorldbook(w);
+      }
+    }
+    characters = await _db.getCharacters();
+    globalWorldbook = await _db.getWorldbook(null);
+    notifyListeners();
+    return c;
+  }
+
   Future<void> updateCharacter(Character c) async {
     await _db.upsertCharacter(c);
     characters = await _db.getCharacters();
@@ -116,7 +148,7 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// 克隆角色（新 ID，名字加"副本"）
+  /// 克隆角色（新 ID，名字加"副本"；全新，不携带聊天与记忆，但保留全部设置）
   Future<void> cloneCharacter(Character c) async {    final nid = DateTime.now().microsecondsSinceEpoch.toString();
     final nc = Character(
       id: nid,
@@ -132,10 +164,75 @@ class AppState extends ChangeNotifier {
       model: c.model,
       replyStyle: c.replyStyle,
       worldbookIds: c.worldbookIds,
+      settings: c.settings,
+      userName: c.userName,
+      userGender: c.userGender,
+      userRelation: c.userRelation,
+      userBackground: c.userBackground,
+      scenario: c.scenario,
+      exampleDialogue: c.exampleDialogue,
+      creatorNotes: c.creatorNotes,
+      systemPrompt: c.systemPrompt,
+      postHistoryInstructions: c.postHistoryInstructions,
+      alternateGreetings: c.alternateGreetings,
+      tags: c.tags,
+      creator: c.creator,
+      characterVersion: c.characterVersion,
+      extensions: c.extensions,
+      lastActivity: DateTime.now().millisecondsSinceEpoch,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     await _db.upsertCharacter(nc);
     characters = await _db.getCharacters();
+    notifyListeners();
+  }
+
+  /// 完整克隆角色：克隆所有设置，并可携带聊天消息与记忆。
+  Future<void> cloneCharacterFull(Character c, {required bool includeHistory}) async {
+    final nid = DateTime.now().microsecondsSinceEpoch.toString();
+    final nc = Character(
+      id: nid,
+      name: '${c.name} 副本',
+      avatar: c.avatar,
+      persona: c.persona,
+      personality: c.personality,
+      tone: c.tone,
+      background: c.background,
+      greeting: c.greeting,
+      chatBackground: c.chatBackground,
+      providerId: c.providerId,
+      model: c.model,
+      replyStyle: c.replyStyle,
+      worldbookIds: c.worldbookIds,
+      settings: c.settings,
+      userName: c.userName,
+      userGender: c.userGender,
+      userRelation: c.userRelation,
+      userBackground: c.userBackground,
+      pinned: c.pinned,
+      scenario: c.scenario,
+      exampleDialogue: c.exampleDialogue,
+      creatorNotes: c.creatorNotes,
+      systemPrompt: c.systemPrompt,
+      postHistoryInstructions: c.postHistoryInstructions,
+      alternateGreetings: c.alternateGreetings,
+      tags: c.tags,
+      creator: c.creator,
+      characterVersion: c.characterVersion,
+      extensions: c.extensions,
+      lastActivity: DateTime.now().millisecondsSinceEpoch,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    await _db.cloneCharacterFull(c, nid, includeHistory);
+    characters = await _db.getCharacters();
+    notifyListeners();
+  }
+
+  /// 完整克隆群聊。
+  Future<void> cloneGroupFull(ChatGroup g, {required bool includeHistory}) async {
+    final nid = DateTime.now().microsecondsSinceEpoch.toString();
+    await _db.cloneGroupFull(g, nid, includeHistory);
+    groups = await _db.getGroups();
     notifyListeners();
   }
 
@@ -250,6 +347,19 @@ class AppState extends ChangeNotifier {
   Future<void> deleteMessage(String id) => _db.deleteMessage(id);
 
   Future<void> deleteSession(String id) => _db.deleteSession(id);
+
+  /// 删除某会话/群聊从某时间点之后的所有消息，并同步删除其产生的长记忆。
+  Future<void> deleteMessagesFrom(String? sessionId, String? groupId, int cutoff,
+      {List<String> memoryOwners = const []}) async {
+    await _db.deleteMessagesFrom(sessionId, groupId, cutoff);
+    for (final owner in memoryOwners) {
+      await _db.deleteMemoriesFor(owner);
+    }
+    characters = await _db.getCharacters();
+    groups = await _db.getGroups();
+    await _refreshLastMessages();
+    notifyListeners();
+  }
 
   // ---------------- Groups (群聊) ----------------
   Future<List<ChatGroup>> allGroups() => _db.getGroups();

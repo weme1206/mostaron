@@ -14,7 +14,15 @@ import '../utils/file_utils.dart';
 class GroupCreateScreen extends StatefulWidget {
   final ChatGroup? group;
   final List<String>? initialMemberIds;
-  const GroupCreateScreen({super.key, this.group, this.initialMemberIds});
+  final String? initialMemoryMode; // 创建时预设的记忆模式
+  final ChatGroup? cloneFrom; // 从某群克隆（新群、携带设置但不带历史/记忆）
+  const GroupCreateScreen({
+    super.key,
+    this.group,
+    this.initialMemberIds,
+    this.initialMemoryMode,
+    this.cloneFrom,
+  });
 
   @override
   State<GroupCreateScreen> createState() => _GroupCreateScreenState();
@@ -33,28 +41,34 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
   int _maxReplies = 1;
   int _autoEvery = 6;
   List<String> _worldbookIds = [];
+  String _memoryMode = 'whole';
   late final String _gid;
 
   @override
   void initState() {
     super.initState();
-    _gid = widget.group?.id ?? DateTime.now().microsecondsSinceEpoch.toString();
-    _autoEvery = widget.group != null && widget.group!.autoMemoryEvery > 0
-        ? widget.group!.autoMemoryEvery
+    final src = widget.cloneFrom ?? widget.group;
+    // 编辑已有群聊时保留原 id；新建/克隆才生成新 id
+    _gid = widget.cloneFrom != null || widget.group == null
+        ? DateTime.now().microsecondsSinceEpoch.toString()
+        : widget.group!.id;
+    _autoEvery = src != null && src.autoMemoryEvery > 0
+        ? src.autoMemoryEvery
         : context.read<AppState>().settings.autoMemoryEvery;
-    final g = widget.group;
+    final g = widget.cloneFrom;
     final s = context.read<AppState>().settings;
-    _name = TextEditingController(text: g?.name ?? '');
-    _uname = TextEditingController(text: g?.userName.isNotEmpty == true ? g!.userName : s.personaName);
-    _ugender = TextEditingController(text: g?.userGender.isNotEmpty == true ? g!.userGender : s.personaGender);
-    _ubg = TextEditingController(text: g?.userBackground.isNotEmpty == true ? g!.userBackground : s.personaBackground);
-    _memberIds = List.of(g?.memberIds ?? widget.initialMemberIds ?? []);
-    _avatar = g?.avatar ?? '';
-    _background = g?.background ?? '';
-    _replyMode = g?.replyMode ?? 'natural';
-    _maxReplies = g?.maxReplies ?? 1;
-    _replyStyle = g?.replyStyle ?? 'default';
-    _worldbookIds = List.of(g?.worldbookIds ?? []);
+    _name = TextEditingController(text: g != null ? '${g.name} 副本' : (src?.name ?? ''));
+    _uname = TextEditingController(text: (g?.userName.isNotEmpty ?? false) ? g!.userName : s.personaName);
+    _ugender = TextEditingController(text: (g?.userGender.isNotEmpty ?? false) ? g!.userGender : s.personaGender);
+    _ubg = TextEditingController(text: (g?.userBackground.isNotEmpty ?? false) ? g!.userBackground : s.personaBackground);
+    _memberIds = List.of(g?.memberIds ?? widget.initialMemberIds ?? (widget.group?.memberIds ?? []));
+    _avatar = g?.avatar ?? widget.group?.avatar ?? '';
+    _background = g?.background ?? widget.group?.background ?? '';
+    _replyMode = g?.replyMode ?? widget.group?.replyMode ?? 'natural';
+    _maxReplies = g?.maxReplies ?? widget.group?.maxReplies ?? 1;
+    _replyStyle = g?.replyStyle ?? widget.group?.replyStyle ?? 'default';
+    _worldbookIds = List.of(g?.worldbookIds ?? widget.group?.worldbookIds ?? []);
+    _memoryMode = widget.initialMemoryMode ?? g?.memoryMode ?? widget.group?.memoryMode ?? 'whole';
   }
 
   @override
@@ -143,7 +157,7 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
       return;
     }
     final g = ChatGroup(
-      id: widget.group?.id ?? _gid,
+      id: _gid,
       name: _name.text.trim(),
       avatar: _avatar,
       background: _background,
@@ -153,6 +167,7 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
       replyStyle: _replyStyle,
       autoMemoryEvery: _autoEvery,
       worldbookIds: _worldbookIds,
+      memoryMode: _memoryMode,
       lastActivity: widget.group?.lastActivity ?? 0,
       userName: _uname.text.trim(),
       userGender: _ugender.text.trim(),
@@ -160,7 +175,7 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
       createdAt: widget.group?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
       pinned: widget.group?.pinned ?? false,
     );
-    if (widget.group == null) {
+    if (widget.group == null || widget.cloneFrom != null) {
       await state.addGroup(g);
     } else {
       await state.updateGroup(g);
@@ -173,7 +188,7 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
     final state = context.watch<AppState>();
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.group == null ? '创建群聊' : '编辑群聊'),
+        title: Text(widget.cloneFrom != null ? '克隆群聊' : (widget.group == null ? '创建群聊' : '编辑群聊')),
         actions: [IconButton(icon: const Icon(Icons.check), onPressed: () => _save(state))],
       ),
       body: ListView(

@@ -6,7 +6,8 @@ import '../services/api_client.dart';
 
 class MemoryScreen extends StatefulWidget {
   final String characterId;
-  const MemoryScreen({super.key, required this.characterId});
+  final String? memoryModeLabel; // 群聊记忆模式小字提示
+  const MemoryScreen({super.key, required this.characterId, this.memoryModeLabel});
 
   @override
   State<MemoryScreen> createState() => _MemoryScreenState();
@@ -168,6 +169,15 @@ class _MemoryScreenState extends State<MemoryScreen> {
             padding: EdgeInsets.all(12),
             child: Text('置顶的记忆会写入 AGENTS.md，进入系统提示词并长期生效。', style: TextStyle(fontSize: 12)),
           ),
+          if (widget.memoryModeLabel != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(widget.memoryModeLabel!,
+                    style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
+              ),
+            ),
           Expanded(
             child: _items.isEmpty
                 ? const Center(child: Text('暂无记忆，点击右下角添加'))
