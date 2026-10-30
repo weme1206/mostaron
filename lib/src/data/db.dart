@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import '../models/models.dart';
 
@@ -583,34 +585,157 @@ class AppDatabase {
   }
 
   // ---------------- Full export / import ----------------
+  /// 收集导出数据里引用的图片文件（头像/背景），base64 内嵌，便于换机迁移。
+  Future<Map<String, String>> _collectAssets(
+      List<Map<String, Object?>> chars,
+      List<Map<String, Object?>> groups,
+      List<Map<String, Object?>> settingsRows) async {
+    final paths = <String>{};
+    void addPath(dynamic v) {
+      if (v is String && v.isNotEmpty && !v.startsWith('asset:') && File(v).existsSync()) {
+        paths.add(v);
+      }
+    }
+
+    for (final c in chars) {
+      addPath(c['avatar']);
+      addPath(c['chat_background']);
+    }
+    for (final g in groups) {
+      addPath(g['avatar']);
+      addPath(g['background']);
+    }
+    for (final s in settingsRows) {
+      final v = s['value'];
+      if (v is String) {
+        try {
+          final m = jsonDecode(v);
+          if (m is Map) {
+            addPath(m['user_avatar']);
+            addPath(m['chat_background']);
+          }
+        } catch (_) {}
+      }
+    }
+    final out = <String, String>{};
+    for (final p in paths) {
+      try {
+        out[p] = base64Encode(await File(p).readAsBytes());
+      } catch (_) {}
+    }
+    return out;
+  }
+
   Future<Map<String, dynamic>> exportAll() async {
     final d = await db;
+    final chars = await d.query('characters');
+    final groups = await d.query('groups');
+    final settingsRows = await d.query('settings');
+    Map<String, String> assets = {};
+    try {
+      assets = await _collectAssets(chars, groups, settingsRows);
+    } catch (_) {}
     return {
       'app': 'mostaron',
-      'version': 2,
-      'settings': await d.query('settings'),
+      'version': 3, // v3: 内嵌图片资源（assets）
+      'settings': settingsRows,
       'providers': await d.query('providers'),
-      'characters': await d.query('characters'),
+      'characters': chars,
       'sessions': await d.query('sessions'),
       'messages': await d.query('messages'),
-      'groups': await d.query('groups'),
+      'groups': groups,
       'memories': await d.query('memories'),
       'worldbook': await d.query('worldbook'),
+      'assets': assets,
     };
   }
 
   Future<void> importAll(Map<String, dynamic> data) async {
     final d = await db;
+    // 1) 还原内嵌图片（旧版本备份没有 assets，跳过即兼容）
+    final pathMap = <String, String>{};
+    final assets = data['assets'];
+    if (assets is Map) {
+      final dir = await getApplicationDocumentsDirectory();
+      var n = 0;
+      for (final entry in assets.entries) {
+        final oldPath = entry.key.toString();
+        final b64 = entry.value;
+        if (b64 is! String || b64.isEmpty) continue;
+        try {
+          final bytes = base64Decode(b64);
+          var ext = oldPath.split('.').last;
+          if (ext.length > 5 || ext.contains('/') || ext.contains('\\')) ext = 'png';
+          final newPath = '${dir.path}/restored_${DateTime.now().microsecondsSinceEpoch}_${n++}.$ext';
+          await File(newPath).writeAsBytes(bytes, flush: true);
+          pathMap[oldPath] = newPath;
+        } catch (_) {}
+      }
+    }
+
+    String remap(dynamic v) {
+      if (v is String && pathMap.containsKey(v)) return pathMap[v]!;
+      return v is String ? v : '';
+    }
+
+    // 2) 插入数据表（不覆盖已存在数据：同 id 跳过）
+    final insertedIds = <String, Set<String>>{};
     final tables = ['settings', 'providers', 'characters', 'sessions', 'messages', 'groups', 'memories', 'worldbook'];
     for (final t in tables) {
       final rows = data[t];
       if (rows is List) {
         for (final r in rows) {
           try {
-            // 不覆盖已存在数据：仅插入新记录（同 id 跳过）
-            await d.insert(t, r as Map<String, dynamic>, conflictAlgorithm: ConflictAlgorithm.ignore);
+            final id = await d.insert(t, r as Map<String, dynamic>, conflictAlgorithm: ConflictAlgorithm.ignore);
+            if (id != 0) {
+              // settings 表主键是 key，其余表主键是 id
+              final pk = t == 'settings' ? (r['key'] ?? '').toString() : (r['id'] ?? '').toString();
+              (insertedIds[t] ??= <String>{}).add(pk);
+            }
           } catch (_) {}
         }
+      }
+    }
+
+    // 3) 对本次新导入的行，把旧图片路径替换为还原后的新路径
+    if (pathMap.isNotEmpty) {
+      for (final c in (data['characters'] as List? ?? const [])) {
+        try {
+          final m = c as Map<String, dynamic>;
+          final id = (m['id'] ?? '').toString();
+          if (!(insertedIds['characters']?.contains(id) ?? false)) continue;
+          await d.update('characters', {
+            'avatar': remap(m['avatar']),
+            'chat_background': remap(m['chat_background']),
+          }, where: 'id = ?', whereArgs: [id]);
+        } catch (_) {}
+      }
+      for (final g in (data['groups'] as List? ?? const [])) {
+        try {
+          final m = g as Map<String, dynamic>;
+          final id = (m['id'] ?? '').toString();
+          if (!(insertedIds['groups']?.contains(id) ?? false)) continue;
+          await d.update('groups', {
+            'avatar': remap(m['avatar']),
+            'background': remap(m['background']),
+          }, where: 'id = ?', whereArgs: [id]);
+        } catch (_) {}
+      }
+      for (final s in (data['settings'] as List? ?? const [])) {
+        try {
+          final m = s as Map<String, dynamic>;
+          final key = (m['key'] ?? '').toString();
+          if (!(insertedIds['settings']?.contains(key) ?? false)) continue;
+          final raw = m['value'];
+          if (raw is! String) continue;
+          final obj = jsonDecode(raw);
+          if (obj is! Map) continue;
+          final map = Map<String, dynamic>.from(obj);
+          if (pathMap.containsKey(map['user_avatar'])) map['user_avatar'] = pathMap[map['user_avatar']];
+          if (pathMap.containsKey(map['chat_background'])) map['chat_background'] = pathMap[map['chat_background']];
+          await d.update('settings', {'value': jsonEncode(map)},
+              where: 'key = ?', whereArgs: [key]);
+        } catch (_) {}
       }
     }
   }

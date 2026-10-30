@@ -51,7 +51,8 @@ class _HomeScreenState extends State<HomeScreen> {
         _confirmExit();
       },
       child: Scaffold(
-        body: _homeBody(state, items),
+        // 未初始化完成前不渲染内容，避免先闪"暂无内容"再跳成列表
+        body: state.initialized ? _homeBody(state, items) : const SizedBox.shrink(),
       ),
     );
   }

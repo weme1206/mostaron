@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -48,6 +49,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   bool _userScrolled = false;
   bool _programmaticJump = false;
   int _searchReturnIndex = -1;
+  final Map<String, GlobalKey> _msgKeys = {};
   bool _inputRewriting = false;
   final List<PendingAttachment> _attachments = [];
 
@@ -89,7 +91,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     });
     _userScrolled = false;
     if (widget.initialSearchTargetId != null) {
-      _jumpToMessage(widget.initialSearchTargetId!);
+      // 查找定位：不要自动滚到底部
+      _scrollToMessage(widget.initialSearchTargetId!);
+      return;
     }
     for (final ms in const [0, 50, 200]) {
       Future.delayed(Duration(milliseconds: ms), () {
@@ -696,34 +700,104 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       }).toList(),
     );
     try {
-      final t = (await ApiClient().completeChat(
-        baseUrl: provider.baseUrl,
-        apiKey: provider.apiKey,
-        model: provider.model,
-        messages: MemoryHelper.buildMessages(transcript),
-        temperature: 0.3,
-      )).trim();
-      if (MemoryHelper.isValid(t)) {
-        final text = MemoryHelper.clean(t);
-        final groupWhole = g.memoryMode == 'whole';
-        if (groupWhole) {
+      final groupWhole = g.memoryMode == 'whole';
+      if (groupWhole) {
+        final t = (await ApiClient().completeChat(
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          model: provider.model,
+          messages: MemoryHelper.buildMessages(transcript),
+          temperature: 0.3,
+        )).trim();
+        if (MemoryHelper.isValid(t)) {
           await state.addMemory(MemoryItem(
             id: DateTime.now().microsecondsSinceEpoch.toString(),
             characterId: 'group_${g.id}',
-            content: text,
+            content: MemoryHelper.clean(t),
           ));
-        } else {
-          // separate/synced：每个成员各记一条（synced 与私聊共用同一 key，实现同步）
-          for (final m in _members.values) {
-            await state.addMemory(MemoryItem(
-              id: '${DateTime.now().microsecondsSinceEpoch}_${m.id}',
-              characterId: m.id,
-              content: text,
-            ));
-          }
+        }
+        return;
+      }
+      // 角色独立记忆：每个角色从自己的视角记录（separate / synced）
+      final members = _members.values.toList();
+      if (members.isEmpty) return;
+      final names = members.map((m) => m.name).join('、');
+      final prompt = '你是记忆整理助手。下面是群聊记录。请分别以每个角色的**第一人称视角**'
+          '各写一条该角色值得记住的关键信息（只写该角色自己关心的：与玩家的关系、约定、'
+          '自己承诺过的事、自己在乎的偏好等），不要写其他角色的视角。\n'
+          '角色列表：$names\n'
+          '严格只输出 JSON 对象，格式：{"角色名": "该角色的记忆条目"}，不要其他文字。\n\n'
+          '对话记录：\n$transcript';
+      final raw = (await ApiClient().completeChat(
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        model: provider.model,
+        messages: [
+          {'role': 'user', 'content': prompt},
+        ],
+        temperature: 0.4,
+      )).trim();
+      final map = _parseJsonMap(raw);
+      var saved = 0;
+      for (final m in members) {
+        final text = map[m.name]?.toString().trim();
+        if (text == null || text.isEmpty) continue;
+        await state.addMemory(MemoryItem(
+          id: '${DateTime.now().microsecondsSinceEpoch}_${m.id}',
+          characterId: m.id,
+          content: text,
+        ));
+        saved++;
+      }
+      // 兜底：模型没返回可解析的 JSON 时，逐个角色单独提炼（各自视角）
+      if (saved == 0) {
+        for (final m in members) {
+          try {
+            final one = (await ApiClient().completeChat(
+              baseUrl: provider.baseUrl,
+              apiKey: provider.apiKey,
+              model: provider.model,
+              messages: [
+                {
+                  'role': 'user',
+                  'content': '你是「${m.name}」。请从你自己的第一人称视角，'
+                      '从下面的群聊记录里提炼 1 条你值得记住的信息（只写你关心的），'
+                      '只输出记忆内容本身。\n\n对话记录：\n$transcript',
+                },
+              ],
+              temperature: 0.3,
+            )).trim();
+            if (MemoryHelper.isValid(one)) {
+              await state.addMemory(MemoryItem(
+                id: '${DateTime.now().microsecondsSinceEpoch}_${m.id}',
+                characterId: m.id,
+                content: MemoryHelper.clean(one),
+              ));
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
+  }
+
+  /// 从模型输出里解析出 {角色名: 记忆} 的 JSON（容忍 ``` 代码块与多余文字）。
+  Map<String, dynamic> _parseJsonMap(String raw) {
+    var t = raw.trim();
+    if (t.startsWith('```')) {
+      final i = t.indexOf('\n');
+      if (i >= 0) t = t.substring(i + 1);
+      final j = t.lastIndexOf('```');
+      if (j >= 0) t = t.substring(0, j);
+      t = t.trim();
+    }
+    final start = t.indexOf('{');
+    final end = t.lastIndexOf('}');
+    if (start >= 0 && end > start) t = t.substring(start, end + 1);
+    try {
+      final v = jsonDecode(t);
+      if (v is Map) return Map<String, dynamic>.from(v);
+    } catch (_) {}
+    return {};
   }
 
   void _jumpToBottom({bool animate = true}) {
@@ -741,20 +815,44 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     });
   }
 
-  /// 查找聊天记录后跳转到某条消息，高亮它。
-  void _jumpToMessage(String id) {
+  /// 查找聊天记录后滚到某条消息并高亮。
+  void _scrollToMessage(String id) {
     final idx = _messages.indexWhere((m) => m.id == id);
     if (idx < 0 || !mounted) return;
     setState(() => _searchReturnIndex = idx);
+    _scrollToIndex(idx);
+  }
+
+  /// 滚动到第 idx 条消息：优先 GlobalKey + ensureVisible，未构建时估算跳转后重试。
+  void _scrollToIndex(int idx, {int attempt = 0}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _programmaticJump = true;
-      final target = _messages.length == 0
+      if (!mounted || idx < 0 || idx >= _messages.length) return;
+      final key = _msgKeys[_messages[idx].id];
+      final ctx = key?.currentContext;
+      if (ctx != null) {
+        _programmaticJump = true;
+        Scrollable.ensureVisible(
+          ctx,
+          alignment: 0.3,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOut,
+        ).whenComplete(() {
+          _programmaticJump = false;
+          _userScrolled = false;
+        });
+        return;
+      }
+      if (!_scroll.hasClients || attempt >= 8) return;
+      final max = _scroll.position.maxScrollExtent;
+      final est = _messages.isEmpty
           ? 0.0
-          : (_scroll.position.maxScrollExtent * (idx / _messages.length))
-              .clamp(0.0, _scroll.position.maxScrollExtent);
-      _scroll.animateTo(target, duration: const Duration(milliseconds: 350), curve: Curves.easeOut);
+          : (max * (idx / _messages.length)).clamp(0.0, max);
+      _programmaticJump = true;
+      _scroll.jumpTo(est);
       _programmaticJump = false;
+      Future.delayed(Duration(milliseconds: 40 + attempt * 20), () {
+        if (mounted) _scrollToIndex(idx, attempt: attempt + 1);
+      });
     });
   }
 
@@ -950,34 +1048,40 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
           final m = _messages[idx];
           final foot = (idx == last && !_streaming) ? _actionFooter(state, m) : null;
           if (m.role == 'user') {
-            return MessageBubble(
+            return KeyedSubtree(
+              key: _msgKeys.putIfAbsent(m.id, () => GlobalKey()),
+              child: MessageBubble(
+                message: m,
+                isUser: true,
+                avatar: buildUserAvatar(context, state.settings, 34),
+                senderName: state.settings.personaName,
+                showAvatar: showUserAvatar,
+                footer: foot,
+                bubbleColor: parseHexColor(state.settings.bubbleSelfColor),
+                bubbleOpacity: state.settings.bubbleOpacity,
+                fontScale: state.settings.fontSize,
+                highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
+                onDeleteFromHere: () => _deleteFromHere(m),
+              ),
+            );
+          }
+          final sender = m.senderCharacterId != null ? _members[m.senderCharacterId] : null;
+          return KeyedSubtree(
+            key: _msgKeys.putIfAbsent(m.id, () => GlobalKey()),
+            child: MessageBubble(
               message: m,
-              isUser: true,
-              avatar: buildUserAvatar(context, state.settings, 34),
-              senderName: state.settings.personaName,
-              showAvatar: showUserAvatar,
+              isUser: false,
+              avatar: sender != null ? buildCharacterAvatar(context, sender, 34) : null,
+              senderName: sender?.name ?? '?',
+              showAvatar: showCharAvatar,
               footer: foot,
-              bubbleColor: parseHexColor(state.settings.bubbleSelfColor),
+              topContent: m.reasoning.trim().isNotEmpty ? ThinkingToggle(reasoning: m.reasoning) : null,
+              bubbleColor: parseHexColor(state.settings.bubbleCharColor),
               bubbleOpacity: state.settings.bubbleOpacity,
               fontScale: state.settings.fontSize,
               highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
               onDeleteFromHere: () => _deleteFromHere(m),
-            );
-          }
-          final sender = m.senderCharacterId != null ? _members[m.senderCharacterId] : null;
-          return MessageBubble(
-            message: m,
-            isUser: false,
-            avatar: sender != null ? buildCharacterAvatar(context, sender, 34) : null,
-            senderName: sender?.name ?? '?',
-            showAvatar: showCharAvatar,
-            footer: foot,
-            topContent: m.reasoning.trim().isNotEmpty ? ThinkingToggle(reasoning: m.reasoning) : null,
-            bubbleColor: parseHexColor(state.settings.bubbleCharColor),
-            bubbleOpacity: state.settings.bubbleOpacity,
-            fontScale: state.settings.fontSize,
-            highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
-            onDeleteFromHere: () => _deleteFromHere(m),
+            ),
           );
         }
         Character? sender;

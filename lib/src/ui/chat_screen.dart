@@ -54,6 +54,7 @@ class _ChatScreenState extends State<ChatScreen> {
   int _searchReturnIndex = -1;
   bool _inputRewriting = false;
   final List<PendingAttachment> _attachments = [];
+  final Map<String, GlobalKey> _msgKeys = {};
 
   @override
   void initState() {
@@ -108,7 +109,9 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _userScrolled = false;
     if (widget.initialSearchTargetId != null) {
-      _jumpToMessage(widget.initialSearchTargetId!);
+      // 查找定位：不要自动滚到底部（否则会覆盖定位）
+      _scrollToMessage(widget.initialSearchTargetId!);
+      return;
     }
     for (final ms in const [0, 50, 200]) {
       Future.delayed(Duration(milliseconds: ms), () {
@@ -661,20 +664,45 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  /// 查找聊天记录后跳转到某条消息，并高亮它；顶部显示"返回查找结果"条。
-  void _jumpToMessage(String id) {
+  /// 查找聊天记录后滚到某条消息并高亮。
+  void _scrollToMessage(String id) {
     final idx = _messages.indexWhere((m) => m.id == id);
     if (idx < 0 || !mounted) return;
     setState(() => _searchReturnIndex = idx);
+    _scrollToIndex(idx);
+  }
+
+  /// 滚动到第 idx 条消息：优先用 GlobalKey + ensureVisible，未构建时先估算跳转再重试。
+  void _scrollToIndex(int idx, {int attempt = 0}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _programmaticJump = true;
-      final target = _messages.length == 0
+      if (!mounted || idx < 0 || idx >= _messages.length) return;
+      final key = _msgKeys[_messages[idx].id];
+      final ctx = key?.currentContext;
+      if (ctx != null) {
+        _programmaticJump = true;
+        Scrollable.ensureVisible(
+          ctx,
+          alignment: 0.3,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOut,
+        ).whenComplete(() {
+          _programmaticJump = false;
+          _userScrolled = false;
+        });
+        return;
+      }
+      if (!_scroll.hasClients || attempt >= 8) return;
+      // 目标未构建：用估算位置先滚过去，构建后再精确对齐
+      final max = _scroll.position.maxScrollExtent;
+      final est = _messages.isEmpty
           ? 0.0
-          : (_scroll.position.maxScrollExtent * (idx / _messages.length))
-              .clamp(0.0, _scroll.position.maxScrollExtent);
-      _scroll.animateTo(target, duration: const Duration(milliseconds: 350), curve: Curves.easeOut);
+          : (max * (idx / _messages.length)).clamp(0.0, max);
+      _programmaticJump = true;
+      _scroll.jumpTo(est);
       _programmaticJump = false;
+      Future.delayed(Duration(milliseconds: 40 + attempt * 20), () {
+        if (mounted) _scrollToIndex(idx, attempt: attempt + 1);
+      });
     });
   }
 
@@ -865,25 +893,28 @@ class _ChatScreenState extends State<ChatScreen> {
           final m = _messages[msgIdx];
           final isLast = msgIdx == _messages.length - 1;
           final reasoning = (m.role == 'assistant' && m.reasoning.isNotEmpty) ? m.reasoning : '';
-          return MessageBubble(
-            message: m,
-            isUser: m.role == 'user',
-            avatar: m.role == 'user'
-                ? buildUserAvatar(context, state.settings, 34)
-                : buildCharacterAvatar(context, c, 34),
-            senderName: m.role == 'user' ? state.settings.personaName : c.name,
-            showAvatar: m.role == 'user' ? showUserAvatar : showCharAvatar,
-            footer: isLast && !_streaming ? _actionFooter(state, m) : null,
-            topContent: reasoning.isNotEmpty ? ThinkingToggle(reasoning: reasoning) : null,
-            bubbleColor: m.role == 'user'
-                ? parseHexColor(state.settings.bubbleSelfColor)
-                : parseHexColor(state.settings.bubbleCharColor),
-            bubbleOpacity: state.settings.bubbleOpacity,
-            fontScale: state.settings.fontSize,
-            highlight: _searchReturnIndex >= 0 && msgIdx == _searchReturnIndex,
-            onCopy: () => _copy(m),
-            onDelete: () => _deleteMessage(m),
-            onDeleteFromHere: () => _deleteFromHere(m),
+          return KeyedSubtree(
+            key: _msgKeys.putIfAbsent(m.id, () => GlobalKey()),
+            child: MessageBubble(
+              message: m,
+              isUser: m.role == 'user',
+              avatar: m.role == 'user'
+                  ? buildUserAvatar(context, state.settings, 34)
+                  : buildCharacterAvatar(context, c, 34),
+              senderName: m.role == 'user' ? state.settings.personaName : c.name,
+              showAvatar: m.role == 'user' ? showUserAvatar : showCharAvatar,
+              footer: isLast && !_streaming ? _actionFooter(state, m) : null,
+              topContent: reasoning.isNotEmpty ? ThinkingToggle(reasoning: reasoning) : null,
+              bubbleColor: m.role == 'user'
+                  ? parseHexColor(state.settings.bubbleSelfColor)
+                  : parseHexColor(state.settings.bubbleCharColor),
+              bubbleOpacity: state.settings.bubbleOpacity,
+              fontScale: state.settings.fontSize,
+              highlight: _searchReturnIndex >= 0 && msgIdx == _searchReturnIndex,
+              onCopy: () => _copy(m),
+              onDelete: () => _deleteMessage(m),
+              onDeleteFromHere: () => _deleteFromHere(m),
+            ),
           );
         }
         final streamingMsg = ChatMessage(

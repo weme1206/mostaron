@@ -180,9 +180,25 @@ class PromptBuilder {
     return msg;
   }
 
+  /// 取最近 [turns] 条消息作为上下文（参考 chatbox：系统提示 + 限定历史 + 当前问题）。
+  /// 加固点：
+  /// 1) 过滤空消息；
+  /// 2) 截断后若首条是 assistant，则从之后第一条 user 开始，保证首条 user 在前
+  ///    （部分接口要求第一条非 system 消息必须是 user）；
+  /// 3) 末尾必须保留当前消息（最后一条），避免被裁掉。
   static List<ChatMessage> _lastTurns(List<ChatMessage> history, int turns) {
-    if (turns <= 0) return history;
-    if (history.length <= turns) return history;
-    return history.sublist(history.length - turns);
+    final list = history.where((m) => m.content.trim().isNotEmpty).toList();
+    if (list.isEmpty) return const [];
+    if (turns <= 0 || list.length <= turns) return list;
+    final tail = list.sublist(list.length - turns);
+    // 首条不能是 assistant（否则跳过它，直到遇到 user）
+    var start = 0;
+    while (start < tail.length - 1 && tail[start].role != 'user') {
+      start++;
+    }
+    final out = tail.sublist(start);
+    // 若全部都是 assistant（没有 user 可对齐），保留最后一条即可
+    if (out.isEmpty) return [list.last];
+    return out;
   }
 }

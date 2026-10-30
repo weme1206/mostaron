@@ -2,7 +2,7 @@ name: mostaron
 description: "mostaron - AI 角色扮演聊天"
 publish_to: 'none'
 
-version: 1.5.0+35
+version: 1.5.1+36
 
 environment:
   sdk: ^3.13.2

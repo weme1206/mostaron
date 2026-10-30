@@ -126,8 +126,12 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> updateCharacter(Character c) async {
-    await _db.upsertCharacter(c);
+    // 编辑角色时保留原有的最近活跃时间，避免卡片沉底
+    final old = await _db.getCharacter(c.id);
+    final keep = (old?.lastActivity ?? 0) > c.lastActivity ? old!.lastActivity : c.lastActivity;
+    await _db.upsertCharacter(keep == c.lastActivity ? c : c.copyWith(lastActivity: keep));
     characters = await _db.getCharacters();
+    await _refreshLastMessages();
     notifyListeners();
   }
 
@@ -374,8 +378,12 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> updateGroup(ChatGroup g) async {
-    await _db.upsertGroup(g);
+    // 编辑群聊时保留原有的最近活跃时间，避免卡片沉底
+    final old = await _db.getGroup(g.id);
+    final keep = (old?.lastActivity ?? 0) > g.lastActivity ? old!.lastActivity : g.lastActivity;
+    await _db.upsertGroup(keep == g.lastActivity ? g : g.copyWith(lastActivity: keep));
     groups = await _db.getGroups();
+    await _refreshLastMessages();
     notifyListeners();
   }
 
