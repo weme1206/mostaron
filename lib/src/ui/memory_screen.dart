@@ -6,9 +6,16 @@ import '../services/api_client.dart';
 import '../services/memory_helper.dart';
 
 class MemoryScreen extends StatefulWidget {
-  final String characterId;
+  final String characterId; // 记忆归属键（角色 id / group_x / group_x_char_y）
   final String? memoryModeLabel; // 群聊记忆模式小字提示
-  const MemoryScreen({super.key, required this.characterId, this.memoryModeLabel});
+  /// 从哪个群的聊天记录生成记忆（角色在群里的独立记忆用）
+  final String? historyGroupId;
+  const MemoryScreen({
+    super.key,
+    required this.characterId,
+    this.memoryModeLabel,
+    this.historyGroupId,
+  });
 
   @override
   State<MemoryScreen> createState() => _MemoryScreenState();
@@ -47,7 +54,9 @@ class _MemoryScreenState extends State<MemoryScreen> {
       return;
     }
     var history = <ChatMessage>[];
-    if (widget.characterId.startsWith('group_')) {
+    if (widget.historyGroupId != null) {
+      history = await state.groupMessages(widget.historyGroupId!);
+    } else if (widget.characterId.startsWith('group_')) {
       history = await state.groupMessages(widget.characterId.substring(6));
     } else {
       final session = await state.getOrCreateSession(widget.characterId);

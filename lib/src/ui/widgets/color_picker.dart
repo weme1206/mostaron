@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import '../../utils/colors.dart';
 
 /// 弹出调色盘，返回用户选择的颜色
 Future<Color?> showColorPicker(BuildContext context, {Color? initial}) {

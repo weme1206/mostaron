@@ -34,6 +34,7 @@ android {
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
         // flag during build.
         versionCode = flutter.versionCode
+        // 对外显示版本号跟随 pubspec.yaml（当前 1.6.0）
         versionName = flutter.versionName
     }
 

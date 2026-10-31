@@ -57,19 +57,33 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  bool _exitDialogShowing = false;
+
   Future<void> _confirmExit() async {
+    // 防止连续按返回键重复弹窗，避免第二次返回被系统当成"退出"
+    if (_exitDialogShowing) return;
+    _exitDialogShowing = true;
     final ok = await showDialog<bool>(
       context: context,
-      builder: (d) => AlertDialog(
-        title: const Text('mostaron：'),
-        content: const Text('你确定要退出应用吗？qwq'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
-          TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('确定')),
-        ],
+      barrierDismissible: false,
+      builder: (d) => PopScope(
+        // 对话框自己吃掉返回键：返回 = 取消，事件不再冒泡到主页
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) Navigator.pop(d, false);
+        },
+        child: AlertDialog(
+          title: const Text('mostaron：'),
+          content: const Text('你确定要退出应用吗？qwq'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
+            TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('确定')),
+          ],
+        ),
       ),
     );
-    if (ok == true) {
+    _exitDialogShowing = false;
+    if (ok == true && mounted) {
       SystemNavigator.pop();
     }
   }
@@ -452,16 +466,6 @@ class _GroupTile extends StatelessWidget {
     }
   }
 
-  static String _modeLabel(String mode) {
-    switch (mode) {
-      case 'all':
-        return '全员回复';
-      case 'designated':
-        return '指定发言';
-      default:
-        return '自然聊天';
-    }
-  }
 }
 
 // ---------------- Grid cards ----------------

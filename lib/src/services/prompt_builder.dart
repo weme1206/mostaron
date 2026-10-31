@@ -1,4 +1,5 @@
 import '../models/models.dart';
+import '../utils/attachment_text.dart';
 import 'settings_resolver.dart';
 
 class PromptBuilder {
@@ -12,8 +13,22 @@ class PromptBuilder {
     bool isGroup = false,
     List<String> groupNames = const [],
     String? replyStyle,
+    String extraPrompt = '',
   }) {
     final sb = StringBuffer();
+
+    // 角色卡里常见 {{char}} / {{user}} 占位符，直接发会把占位符原样带给模型
+    String sub(String s) => s
+        .replaceAll('{{char}}', character.name)
+        .replaceAll('{{user}}', eff.userName)
+        .replaceAll('<CHAR>', character.name)
+        .replaceAll('<USER>', eff.userName);
+
+    // 角色卡自带的系统提示（SillyTavern system_prompt）：优先级最高
+    if (character.systemPrompt.isNotEmpty) {
+      sb.writeln(sub(character.systemPrompt).trim());
+      sb.writeln();
+    }
 
     sb.writeln('### 角色设定');
     sb.writeln('你是「${character.name}」，请始终保持这个角色身份，用第一人称扮演。');
@@ -24,6 +39,12 @@ class PromptBuilder {
       sb.writeln();
       sb.writeln('### 背景故事');
       sb.writeln(character.background);
+    }
+    // 角色卡带的场景设定（scenario）
+    if (character.scenario.isNotEmpty) {
+      sb.writeln();
+      sb.writeln('### 场景');
+      sb.writeln(sub(character.scenario));
     }
 
     if (isGroup && groupNames.isNotEmpty) {
@@ -85,6 +106,28 @@ class PromptBuilder {
     sb.writeln('用圆括号（或半角括号）包住你的动作，例如（轻轻笑了一下）。台词直接说出来。'
         '不要使用星号包裹动作。');
 
+    // 角色卡里的示例对话：让模型模仿这个角色的说话方式（原来完全没发给模型）
+    if (character.exampleDialogue.isNotEmpty) {
+      sb.writeln();
+      sb.writeln('### 示例对话（模仿其中的语气与说话方式，不要照抄内容）');
+      sb.writeln(sub(character.exampleDialogue).trim());
+    }
+
+    // 全局额外提示词
+    final extra = extraPrompt.trim();
+    if (extra.isNotEmpty) {
+      sb.writeln();
+      sb.writeln('### 额外要求');
+      sb.writeln(extra);
+    }
+
+    // 历史后置指令（SillyTavern post_history_instructions）：放在最末尾，权重最高
+    if (character.postHistoryInstructions.isNotEmpty) {
+      sb.writeln();
+      sb.writeln('### 最高优先级指令');
+      sb.writeln(sub(character.postHistoryInstructions).trim());
+    }
+
     return sb.toString();
   }
 
@@ -123,12 +166,13 @@ class PromptBuilder {
   }
 
   /// 单聊
-  static List<Map<String, String>> buildMessages({
+  static List<Map<String, dynamic>> buildMessages({
     required Character character,
     required EffectiveSettings eff,
     required List<WorldbookEntry> worldbook,
     required List<MemoryItem> memories,
     required List<ChatMessage> history,
+    String extraPrompt = '',
   }) {
     final recent = _lastTurns(history, eff.contextTurns);
     final recentText = recent.map((m) => m.content).join('\n');
@@ -138,18 +182,23 @@ class PromptBuilder {
       worldbook: worldbook,
       memories: memories,
       recentText: recentText,
+      extraPrompt: extraPrompt,
     );
-    final msg = <Map<String, String>>[
+    // 注意：元素类型必须是 Map<String, dynamic>（与返回类型一致）。
+    // 若这里写成 <Map<String, String>>，调用方对 payload[i] 赋多模态内容
+    // （Map<String, dynamic>）时会触发 Dart 泛型协变的运行时 TypeError，
+    // 且异常发生在请求发出之前——曾导致"发图片/文件后一直等待模型响应"。
+    final msg = <Map<String, dynamic>>[
       {'role': 'system', 'content': system},
     ];
     for (final m in recent) {
-      msg.add({'role': m.role == 'user' ? 'user' : 'assistant', 'content': m.content});
+      msg.add({'role': m.role == 'user' ? 'user' : 'assistant', 'content': contentForModel(m)});
     }
     return msg;
   }
 
   /// 群聊：为某个角色组装
-  static List<Map<String, String>> buildGroupMessages({
+  static List<Map<String, dynamic>> buildGroupMessages({
     required Character character,
     required EffectiveSettings eff,
     required List<WorldbookEntry> worldbook,
@@ -158,6 +207,7 @@ class PromptBuilder {
     required List<String> groupNames,
     String? replyStyle,
     List<MemoryItem> groupMemories = const [],
+    String extraPrompt = '',
   }) {
     final recent = _lastTurns(history, eff.contextTurns);
     final recentText = recent.map((m) => m.content).join('\n');
@@ -170,12 +220,14 @@ class PromptBuilder {
       isGroup: true,
       groupNames: groupNames,
       replyStyle: replyStyle,
+      extraPrompt: extraPrompt,
     );
-    final msg = <Map<String, String>>[
+    // 同 buildMessages：元素类型必须与返回类型一致，避免协变 TypeError
+    final msg = <Map<String, dynamic>>[
       {'role': 'system', 'content': system},
     ];
     for (final m in recent) {
-      msg.add({'role': m.role == 'user' ? 'user' : 'assistant', 'content': m.content});
+      msg.add({'role': m.role == 'user' ? 'user' : 'assistant', 'content': contentForModel(m)});
     }
     return msg;
   }

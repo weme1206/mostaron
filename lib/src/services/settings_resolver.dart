@@ -7,6 +7,8 @@ class EffectiveSettings {
   int memoryLimit;
   bool realSense;
   int autoMemoryEvery;
+  double memoryCompressCountRatio;
+  double memoryCompressKeepRatio;
   String userName;
   String userGender;
   String userRelation;
@@ -19,6 +21,8 @@ class EffectiveSettings {
     required this.memoryLimit,
     required this.realSense,
     required this.autoMemoryEvery,
+    required this.memoryCompressCountRatio,
+    required this.memoryCompressKeepRatio,
     required this.userName,
     required this.userGender,
     required this.userRelation,
@@ -33,6 +37,8 @@ EffectiveSettings resolveSettings(AppSettings main) => EffectiveSettings(
       memoryLimit: main.memoryLimit,
       realSense: main.realSense,
       autoMemoryEvery: main.autoMemoryEvery,
+      memoryCompressCountRatio: main.memoryCompressCountRatio,
+      memoryCompressKeepRatio: main.memoryCompressKeepRatio,
       userName: main.personaName,
       userGender: main.personaGender,
       userRelation: main.personaRelation,

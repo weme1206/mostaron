@@ -8,7 +8,8 @@ Widget buildCharacterAvatar(BuildContext context, Character c, double size) {
   if (avatar.startsWith('asset:')) {
     return PresetAvatar(id: avatar.substring(6), size: size);
   }
-  if (avatar.isEmpty) {
+  if (avatar.isEmpty || !File(avatar).existsSync()) {
+    // 文件被清理/换机后不能直接 FileImage，否则解码失败会抛异常
     return CircleAvatar(
       radius: size / 2,
       child: Text(c.name.isEmpty ? '?' : c.name.substring(0, 1), style: TextStyle(fontSize: size * 0.4)),
@@ -22,7 +23,7 @@ Widget buildGroupAvatar(BuildContext context, ChatGroup g, double size) {
   if (avatar.startsWith('asset:')) {
     return PresetAvatar(id: avatar.substring(6), size: size);
   }
-  if (avatar.isEmpty) {
+  if (avatar.isEmpty || !File(avatar).existsSync()) {
     return CircleAvatar(
       radius: size / 2,
       child: Text(g.name.isEmpty ? '群' : g.name.substring(0, 1), style: TextStyle(fontSize: size * 0.4)),
@@ -36,7 +37,7 @@ Widget buildUserAvatar(BuildContext context, AppSettings s, double size) {
   if (avatar.startsWith('asset:')) {
     return PresetAvatar(id: avatar.substring(6), size: size);
   }
-  if (avatar.isEmpty) {
+  if (avatar.isEmpty || !File(avatar).existsSync()) {
     return CircleAvatar(
       radius: size / 2,
       backgroundColor: Theme.of(context).colorScheme.primaryContainer,

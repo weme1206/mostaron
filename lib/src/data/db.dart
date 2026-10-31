@@ -21,7 +21,7 @@ class AppDatabase {
     final path = p.join(dir, 'mostaron.db');
     return openDatabase(
       path,
-      version: 8,
+      version: 10,
       onCreate: (db, v) async {
         await _createTables(db);
       },
@@ -59,7 +59,8 @@ class AppDatabase {
     await db.execute('''
       CREATE TABLE messages (
         id TEXT PRIMARY KEY, session_id TEXT, group_id TEXT, role TEXT,
-        content TEXT, reasoning TEXT, sender_id TEXT, created_at INTEGER
+        content TEXT, reasoning TEXT, sender_id TEXT, created_at INTEGER,
+        meta TEXT
       )
     ''');
     await db.execute('''
@@ -75,7 +76,7 @@ class AppDatabase {
     await db.execute('''
       CREATE TABLE memories (
         id TEXT PRIMARY KEY, character_id TEXT, content TEXT,
-        pinned INTEGER, created_at INTEGER
+        pinned INTEGER, created_at INTEGER, kind TEXT, summary_of TEXT
       )
     ''');
     await db.execute('''
@@ -85,6 +86,24 @@ class AppDatabase {
       )
     ''');
     await db.execute('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)');
+    await _createIndexes(db);
+  }
+
+  /// 索引：消息按会话/群聊 + 时间、记忆按归属 + 时间、会话按角色。
+  /// 没有这些索引时，几千条消息后的 count/分页/查找定位全是全表扫描。
+  Future<void> _createIndexes(Database db) async {
+    const list = [
+      'CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)',
+      'CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id, created_at)',
+      'CREATE INDEX IF NOT EXISTS idx_memories_owner ON memories(character_id, created_at)',
+      'CREATE INDEX IF NOT EXISTS idx_sessions_char ON sessions(character_id, updated_at)',
+      'CREATE INDEX IF NOT EXISTS idx_worldbook_owner ON worldbook(character_id, created_at)',
+    ];
+    for (final sql in list) {
+      try {
+        await db.execute(sql);
+      } catch (_) {}
+    }
   }
 
   Future<void> _upgrade(Database db, int oldV, int newV) async {
@@ -198,6 +217,23 @@ class AppDatabase {
         await db.execute('ALTER TABLE groups ADD COLUMN memory_mode TEXT');
       } catch (_) {}
     }
+    if (oldV < 9) {
+      // 消息附件元数据（图片宽高等）
+      try {
+        await db.execute('ALTER TABLE messages ADD COLUMN meta TEXT');
+      } catch (_) {}
+      // 记忆压缩：kind=normal/summary；summary_of 记录来源记忆 id
+      try {
+        await db.execute('ALTER TABLE memories ADD COLUMN kind TEXT');
+      } catch (_) {}
+      try {
+        await db.execute('ALTER TABLE memories ADD COLUMN summary_of TEXT');
+      } catch (_) {}
+    }
+    if (oldV < 10) {
+      // 性能：长会话下的消息/记忆查询索引
+      await _createIndexes(db);
+    }
   }
 
   Future<void> saveSettings(AppSettings s) async {
@@ -297,6 +333,7 @@ class AppDatabase {
             'reasoning': m['reasoning'],
             'sender_id': m['sender_id'],
             'created_at': m['created_at'],
+            'meta': m['meta'], // 附件（图片等）不能丢，否则克隆后图片变空白
           }, conflictAlgorithm: ConflictAlgorithm.ignore);
         }
       }
@@ -308,6 +345,8 @@ class AppDatabase {
           'content': m['content'],
           'pinned': m['pinned'],
           'created_at': m['created_at'],
+          'kind': m['kind'],
+          // summary_of 指向原记忆 id，克隆后已失效，故意不复制
         }, conflictAlgorithm: ConflictAlgorithm.ignore);
       }
     });
@@ -331,6 +370,7 @@ class AppDatabase {
           'reasoning': m['reasoning'],
           'sender_id': m['sender_id'],
           'created_at': m['created_at'],
+          'meta': m['meta'], // 附件不能丢
         }, conflictAlgorithm: ConflictAlgorithm.ignore);
       }
       final mems = await txn.query('memories', where: 'character_id = ?', whereArgs: ['group_${g.id}']);
@@ -341,6 +381,22 @@ class AppDatabase {
           'content': m['content'],
           'pinned': m['pinned'],
           'created_at': m['created_at'],
+          'kind': m['kind'],
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      // 角色独立记忆（separate 模式存于 group_<id>_char_<cid>）
+      final sep = await txn.query('memories',
+          where: "character_id LIKE ?", whereArgs: ['group_${g.id}_char_%']);
+      for (final m in sep) {
+        final owner = m['character_id'] as String;
+        final cid = owner.substring('group_${g.id}_char_'.length);
+        await txn.insert('memories', {
+          'id': '${newId}_${m['id']}',
+          'character_id': 'group_${newId}_char_$cid',
+          'content': m['content'],
+          'pinned': m['pinned'],
+          'created_at': m['created_at'],
+          'kind': m['kind'],
         }, conflictAlgorithm: ConflictAlgorithm.ignore);
       }
     });
@@ -354,6 +410,8 @@ class AppDatabase {
     }
     await d.delete('sessions', where: 'character_id = ?', whereArgs: [id]);
     await d.delete('messages', where: 'sender_id = ?', whereArgs: [id]);
+    // 记忆、世界书随角色一起清理，避免留下孤儿数据
+    await d.delete('memories', where: 'character_id = ?', whereArgs: [id]);
     await d.delete('characters', where: 'id = ?', whereArgs: [id]);
   }
 
@@ -384,18 +442,100 @@ class AppDatabase {
   }
 
   // ---------------- Messages ----------------
+  // 注意：排序必须与分页切片一致（created_at, rowid），
+  // 否则同一毫秒内的多条消息顺序不同，会导致查找定位的索引偏移。
   Future<List<ChatMessage>> getMessages(String sessionId) async {
     final d = await db;
     final rows = await d.query('messages',
-        where: 'session_id = ?', whereArgs: [sessionId], orderBy: 'created_at ASC');
+        where: 'session_id = ?',
+        whereArgs: [sessionId],
+        orderBy: 'created_at ASC, rowid ASC');
     return rows.map(ChatMessage.fromMap).toList();
   }
 
   Future<List<ChatMessage>> getGroupMessages(String groupId) async {
     final d = await db;
     final rows = await d.query('messages',
-        where: 'group_id = ?', whereArgs: [groupId], orderBy: 'created_at ASC');
+        where: 'group_id = ?',
+        whereArgs: [groupId],
+        orderBy: 'created_at ASC, rowid ASC');
     return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  // ---- 分页（窗口加载）----
+
+  Future<int> countMessagesForSession(String sessionId) async {
+    final d = await db;
+    final r = await d.rawQuery(
+        'SELECT COUNT(*) c FROM messages WHERE session_id = ?', [sessionId]);
+    return Sqflite.firstIntValue(r) ?? 0;
+  }
+
+  Future<int> countMessagesForGroup(String groupId) async {
+    final d = await db;
+    final r = await d
+        .rawQuery('SELECT COUNT(*) c FROM messages WHERE group_id = ?', [groupId]);
+    return Sqflite.firstIntValue(r) ?? 0;
+  }
+
+  /// 角色回复条数（用于自动记忆计数，不受窗口加载影响）
+  Future<int> countAssistantForSession(String sessionId) async {
+    final d = await db;
+    final r = await d.rawQuery(
+        "SELECT COUNT(*) c FROM messages WHERE session_id = ? AND role = 'assistant'",
+        [sessionId]);
+    return Sqflite.firstIntValue(r) ?? 0;
+  }
+
+  Future<int> countAssistantForGroup(String groupId) async {
+    final d = await db;
+    final r = await d.rawQuery(
+        "SELECT COUNT(*) c FROM messages WHERE group_id = ? AND role = 'assistant'",
+        [groupId]);
+    return Sqflite.firstIntValue(r) ?? 0;
+  }
+
+  Future<List<ChatMessage>> messageSliceForSession(String sessionId, int offset, int limit) async {
+    final d = await db;
+    final rows = await d.query('messages',
+        where: 'session_id = ?',
+        whereArgs: [sessionId],
+        orderBy: 'created_at ASC, rowid ASC',
+        offset: offset,
+        limit: limit);
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  Future<List<ChatMessage>> messageSliceForGroup(String groupId, int offset, int limit) async {
+    final d = await db;
+    final rows = await d.query('messages',
+        where: 'group_id = ?',
+        whereArgs: [groupId],
+        orderBy: 'created_at ASC, rowid ASC',
+        offset: offset,
+        limit: limit);
+    return rows.map(ChatMessage.fromMap).toList();
+  }
+
+  /// 全局索引（0-based，按 created_at 升序）
+  Future<int> indexOfMessageForSession(String sessionId, String messageId) async {
+    final d = await db;
+    final r = await d.rawQuery('''
+      SELECT COUNT(*) c FROM messages
+      WHERE session_id = ? AND (created_at < (SELECT created_at FROM messages WHERE id = ?)
+        OR (created_at = (SELECT created_at FROM messages WHERE id = ?) AND rowid < (SELECT rowid FROM messages WHERE id = ?)))
+    ''', [sessionId, messageId, messageId, messageId]);
+    return Sqflite.firstIntValue(r) ?? 0;
+  }
+
+  Future<int> indexOfMessageForGroup(String groupId, String messageId) async {
+    final d = await db;
+    final r = await d.rawQuery('''
+      SELECT COUNT(*) c FROM messages
+      WHERE group_id = ? AND (created_at < (SELECT created_at FROM messages WHERE id = ?)
+        OR (created_at = (SELECT created_at FROM messages WHERE id = ?) AND rowid < (SELECT rowid FROM messages WHERE id = ?)))
+    ''', [groupId, messageId, messageId, messageId]);
+    return Sqflite.firstIntValue(r) ?? 0;
   }
 
   Future<ChatMessage?> getMessage(String id) async {
@@ -487,15 +627,41 @@ class AppDatabase {
     return t;
   }
 
-  /// 删除某用户（角色/群标识）下所有记忆。
-  Future<void> deleteMemoriesFor(String ownerId) async {
+  /// 删除某用户（角色/群标识）下的记忆。
+  /// [fromMs] 非空时只删该时间点之后产生的记忆（用于"删除从这里开始的消息"），
+  /// 并且跳过置顶记忆——置顶是用户明确要长期保留的规则。
+  Future<void> deleteMemoriesFor(String ownerId, {int? fromMs}) async {
     final d = await db;
-    await d.delete('memories', where: 'character_id = ?', whereArgs: [ownerId]);
+    if (fromMs == null) {
+      await d.delete('memories', where: 'character_id = ?', whereArgs: [ownerId]);
+    } else {
+      await d.delete('memories',
+          where: 'character_id = ? AND created_at >= ? AND pinned = 0',
+          whereArgs: [ownerId, fromMs]);
+    }
   }
 
-  Future<void> _touch(Database d, String table, String id) async {
-    final t = DateTime.now().millisecondsSinceEpoch;
-    await d.update(table, {'updated_at': t}, where: 'id = ?', whereArgs: [id]);
+  /// 关键词搜索（SQL 侧过滤，避免把整段会话读进内存）。
+  /// 多个关键词之间是"任一命中"（与本地 SearchUtil.search 保持一致）。
+  Future<List<ChatMessage>> searchMessages({
+    String? sessionId,
+    String? groupId,
+    required List<String> words,
+    int limit = 500,
+  }) async {
+    if (words.isEmpty) return const [];
+    final d = await db;
+    final keys = sessionId != null ? 'session_id = ?' : 'group_id = ?';
+    final keyArg = sessionId ?? groupId ?? '';
+    final like = words.map((_) => 'content LIKE ?').join(' OR ');
+    final args = <Object?>[keyArg, ...words.map((w) => '%$w%'), limit];
+    final rows = await d.rawQuery('''
+      SELECT * FROM messages
+      WHERE $keys AND ($like)
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    ''', args);
+    return rows.map(ChatMessage.fromMap).toList();
   }
 
   // ---------------- Groups ----------------
@@ -520,6 +686,10 @@ class AppDatabase {
   Future<void> deleteGroup(String id) async {
     final d = await db;
     await d.delete('messages', where: 'group_id = ?', whereArgs: [id]);
+    // 群整体记忆 + 各角色的群内独立记忆
+    await d.delete('memories', where: 'character_id = ?', whereArgs: ['group_$id']);
+    await d.delete('memories',
+        where: 'character_id LIKE ?', whereArgs: ['group_${id}_char_%']);
     await d.delete('groups', where: 'id = ?', whereArgs: [id]);
   }
 
@@ -533,27 +703,6 @@ class AppDatabase {
     return rows.map(MemoryItem.fromMap).toList();
   }
 
-  Future<int> countMemories(String? characterId) async {
-    final d = await db;
-    final cnt = characterId == null
-        ? await d.rawQuery('SELECT COUNT(*) c FROM memories WHERE character_id IS NULL')
-        : await d.rawQuery('SELECT COUNT(*) c FROM memories WHERE character_id = ?', [characterId]);
-    return Sqflite.firstIntValue(cnt) ?? 0;
-  }
-
-  Future<void> pruneMemories(String? characterId, int keep) async {
-    final d = await db;
-    final rows = characterId == null
-        ? await d.query('memories', where: 'character_id IS NULL AND pinned = 0', orderBy: 'created_at ASC')
-        : await d.query('memories',
-            where: 'character_id = ? AND pinned = 0', whereArgs: [characterId], orderBy: 'created_at ASC');
-    if (rows.length > keep) {
-      for (int i = 0; i < rows.length - keep; i++) {
-        await d.delete('memories', where: 'id = ?', whereArgs: [rows[i]['id']]);
-      }
-    }
-  }
-
   Future<void> upsertMemory(MemoryItem m) async {
     final d = await db;
     await d.insert('memories', m.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
@@ -562,6 +711,20 @@ class AppDatabase {
   Future<void> deleteMemory(String id) async {
     final d = await db;
     await d.delete('memories', where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 删除一批记忆（记忆压缩用，事务保证原子性）
+  Future<void> deleteMemoriesByIds(List<String> ids, {List<MemoryItem> insert = const []}) async {
+    if (ids.isEmpty && insert.isEmpty) return;
+    final d = await db;
+    await d.transaction((txn) async {
+      for (final id in ids) {
+        await txn.delete('memories', where: 'id = ?', whereArgs: [id]);
+      }
+      for (final m in insert) {
+        await txn.insert('memories', m.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
   }
 
   // ---------------- Worldbook ----------------
@@ -585,11 +748,40 @@ class AppDatabase {
   }
 
   // ---------------- Full export / import ----------------
-  /// 收集导出数据里引用的图片文件（头像/背景），base64 内嵌，便于换机迁移。
+  /// 从消息里提取图片路径：新的 meta 字段 + 旧格式的 ［图片：path］ 标记。
+  static List<String> _imagePathsInMessage(Map<String, Object?> m) {
+    final out = <String>[];
+    final meta = m['meta'];
+    if (meta is String && meta.isNotEmpty) {
+      try {
+        final list = jsonDecode(meta);
+        if (list is List) {
+          for (final a in list) {
+            if (a is Map && (a['type'] ?? '') == 'image' && (a['path'] ?? '') is String) {
+              final p = a['path'] as String;
+              if (p.isNotEmpty) out.add(p);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    final content = m['content'];
+    if (content is String && content.contains('［图片：')) {
+      final re = RegExp(r'［图片：([^］]+)］');
+      for (final match in re.allMatches(content)) {
+        final p = match.group(1)?.trim() ?? '';
+        if (p.isNotEmpty) out.add(p);
+      }
+    }
+    return out;
+  }
+
+  /// 收集导出数据里引用的图片文件（头像/背景/聊天图片），base64 内嵌，便于换机迁移。
   Future<Map<String, String>> _collectAssets(
       List<Map<String, Object?>> chars,
       List<Map<String, Object?>> groups,
-      List<Map<String, Object?>> settingsRows) async {
+      List<Map<String, Object?>> settingsRows,
+      List<Map<String, Object?>> messages) async {
     final paths = <String>{};
     void addPath(dynamic v) {
       if (v is String && v.isNotEmpty && !v.startsWith('asset:') && File(v).existsSync()) {
@@ -617,37 +809,85 @@ class AppDatabase {
         } catch (_) {}
       }
     }
+    // 聊天记录里的图片
+    for (final m in messages) {
+      for (final p in _imagePathsInMessage(m)) {
+        addPath(p);
+      }
+    }
+    // base64 会让体积膨胀 1/3，图片多时容易 OOM。
+    // 单张超过 8MB 或总量超过 80MB 就跳过（聊天图片本来就有压缩副本）。
+    const singleLimit = 8 * 1024 * 1024;
+    const totalLimit = 80 * 1024 * 1024;
     final out = <String, String>{};
+    var total = 0;
     for (final p in paths) {
       try {
-        out[p] = base64Encode(await File(p).readAsBytes());
+        final f = File(p);
+        final len = await f.length();
+        if (len > singleLimit) continue;
+        if (total + len > totalLimit) continue;
+        final bytes = await f.readAsBytes();
+        out[p] = base64Encode(bytes);
+        total += len;
       } catch (_) {}
     }
     return out;
   }
 
-  Future<Map<String, dynamic>> exportAll() async {
+  /// 导出全部数据。
+  ///
+  /// [includeProviders] 为 false 时不写入 providers 表（即不导出接口地址/密钥），
+  /// 同时清掉设置里的默认接口指向，避免导入后引用一个不存在的接口。
+  /// 头像、角色聊天背景、群聊背景、全局聊天背景和聊天记录里的图片都会以
+  /// base64 内嵌在 assets 里，换机后可完整还原。
+  Future<Map<String, dynamic>> exportAll({bool includeProviders = true}) async {
     final d = await db;
     final chars = await d.query('characters');
     final groups = await d.query('groups');
-    final settingsRows = await d.query('settings');
+    var settingsRows = await d.query('settings');
+    final messages = await d.query('messages');
     Map<String, String> assets = {};
     try {
-      assets = await _collectAssets(chars, groups, settingsRows);
+      assets = await _collectAssets(chars, groups, settingsRows, messages);
     } catch (_) {}
-    return {
+    final data = <String, dynamic>{
       'app': 'mostaron',
-      'version': 3, // v3: 内嵌图片资源（assets）
+      'version': 5, // v5: 可选择不导出接口配置
+      'providers_included': includeProviders,
       'settings': settingsRows,
-      'providers': await d.query('providers'),
       'characters': chars,
       'sessions': await d.query('sessions'),
-      'messages': await d.query('messages'),
+      'messages': messages,
       'groups': groups,
       'memories': await d.query('memories'),
       'worldbook': await d.query('worldbook'),
       'assets': assets,
     };
+    if (includeProviders) {
+      data['providers'] = await d.query('providers');
+    } else {
+      data['settings'] = _stripDefaultProvider(settingsRows);
+    }
+    return data;
+  }
+
+  /// 把 settings 行里的默认接口指向清空（仅用于不导出接口配置的备份）。
+  List<Map<String, Object?>> _stripDefaultProvider(List<Map<String, Object?>> rows) {
+    return rows.map((r) {
+      if ((r['key'] ?? '').toString() != 'app') return r;
+      final raw = r['value'];
+      if (raw is! String) return r;
+      try {
+        final obj = jsonDecode(raw);
+        if (obj is! Map) return r;
+        final m = Map<String, dynamic>.from(obj);
+        m['default_provider_id'] = '';
+        return <String, Object?>{...r, 'value': jsonEncode(m)};
+      } catch (_) {
+        return r;
+      }
+    }).toList();
   }
 
   Future<void> importAll(Map<String, dynamic> data) async {
@@ -737,13 +977,50 @@ class AppDatabase {
               where: 'key = ?', whereArgs: [key]);
         } catch (_) {}
       }
-    }
-  }
+      // 消息里的图片：meta 字段 + 旧格式 ［图片：path］ 标记
+      String remapText(String s) {
+        for (final e in pathMap.entries) {
+          s = s.replaceAll(e.key, e.value);
+        }
+        return s;
+      }
 
-  Future<void> clearAll() async {
-    final d = await db;
-    for (final t in ['settings', 'providers', 'characters', 'sessions', 'messages', 'groups', 'memories', 'worldbook']) {
-      await d.delete(t);
+      for (final msg in (data['messages'] as List? ?? const [])) {
+        try {
+          final m = msg as Map<String, dynamic>;
+          final id = (m['id'] ?? '').toString();
+          if (!(insertedIds['messages']?.contains(id) ?? false)) continue;
+
+          // meta
+          var newMeta = m['meta'];
+          final rawMeta = m['meta'];
+          if (rawMeta is String && rawMeta.isNotEmpty) {
+            try {
+              final list = jsonDecode(rawMeta);
+              if (list is List) {
+                final outList = <Map<String, dynamic>>[];
+                for (final a in list) {
+                  if (a is Map) {
+                    final am = Map<String, dynamic>.from(a);
+                    final p = am['path']?.toString() ?? '';
+                    if (pathMap.containsKey(p)) am['path'] = pathMap[p];
+                    outList.add(am);
+                  }
+                }
+                newMeta = jsonEncode(outList);
+              }
+            } catch (_) {}
+          }
+          // 旧标记
+          final content = m['content']?.toString() ?? '';
+          final newContent = pathMap.isEmpty ? content : remapText(content);
+
+          await d.update('messages', {
+            'meta': newMeta,
+            'content': newContent,
+          }, where: 'id = ?', whereArgs: [id]);
+        } catch (_) {}
+      }
     }
   }
 }

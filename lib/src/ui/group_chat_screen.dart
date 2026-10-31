@@ -4,12 +4,17 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/models.dart';
 import '../services/api_client.dart';
 import '../services/memory_helper.dart';
 import '../services/prompt_builder.dart';
+import '../services/vision_payload.dart';
 import '../services/settings_resolver.dart';
 import '../utils/colors.dart';
+import '../utils/file_adopt.dart';
+import '../utils/attachment_text.dart';
+import '../utils/image_utils.dart';
 import '../state/app_state.dart';
 import 'widgets/avatars.dart';
 import 'widgets/message_bubble.dart';
@@ -26,7 +31,13 @@ import 'widgets/attachment_strip.dart';
 class GroupChatScreen extends StatefulWidget {
   final String groupId;
   final String? initialSearchTargetId; // 查找聊天记录后定位到某条消息
-  const GroupChatScreen({super.key, required this.groupId, this.initialSearchTargetId});
+  final int? initialSearchTargetIndex; // 全局索引（保留兼容，实际按 DB 重算）
+  const GroupChatScreen({
+    super.key,
+    required this.groupId,
+    this.initialSearchTargetId,
+    this.initialSearchTargetIndex,
+  });
 
   @override
   State<GroupChatScreen> createState() => _GroupChatScreenState();
@@ -34,40 +45,93 @@ class GroupChatScreen extends StatefulWidget {
 
 class _GroupChatScreenState extends State<GroupChatScreen> {
   ChatGroup? _group;
+  /// 消息窗口，最新在前（_messages[0] = 最新）
   List<ChatMessage> _messages = [];
   Map<String, Character> _members = {};
   final TextEditingController _input = TextEditingController();
-  final ScrollController _scroll = ScrollController();
 
   bool _streaming = false;
+  /// 流式请求序号：finally 兜底时判断"是否已被新的请求取代"
+  int _streamSeq = 0;
   bool _generating = false;
   String _streamSender = '';
   String _streamText = '';
   String _streamReasoning = '';
   bool _loading = true;
   int _turn = 0; // 用于轮流回复起始位置
-  bool _userScrolled = false;
-  bool _programmaticJump = false;
   int _searchReturnIndex = -1;
-  final Map<String, GlobalKey> _msgKeys = {};
   bool _inputRewriting = false;
   final List<PendingAttachment> _attachments = [];
+
+  // 索引锚定列表（只在"查找定位"时使用）
+  final ItemScrollController _itemScroll = ItemScrollController();
+  final ItemPositionsListener _itemPositions = ItemPositionsListener.create();
+  /// 普通进入：正序/反序 ListView 共用（和私聊一致，offset 0 恒为可视起点）
+  final ScrollController _plainScroll = ScrollController();
+
+  /// 是否处于"查找定位"模式：只有这时才用索引锚定列表
+  bool get _anchored => widget.initialSearchTargetId != null || _searchReturnIndex >= 0;
+
+  // ---- 窗口加载（分页）----
+  static const int _minPageSize = 30;
+  static const int _searchBefore = 10;
+  static const int _searchAfter = 10;
+  int _pageSize = _minPageSize;
+  int _total = 0;
+  int _windowStart = 0; // 已加载窗口中最老一条的全局索引
+  bool _loadingOlder = false;
+  bool _loadingNewer = false;
+  int _pagingSuppressUntil = 0;
+  bool get _hasOlder => _windowStart > 0;
+  bool get _hasNewer => _windowStart + _messages.length < _total;
+  bool get _pagingSuppressed =>
+      DateTime.now().millisecondsSinceEpoch < _pagingSuppressUntil;
 
   @override
   void initState() {
     super.initState();
-    _scroll.addListener(_onScroll);
+    // 两种模式各挂一个监听：查找定位用条目索引，普通进入用像素偏移（和私聊一致）
+    _itemPositions.itemPositions.addListener(_onPositionsChanged);
+    _plainScroll.addListener(_onPlainScrollPaging);
     _load();
   }
 
-  void _onScroll() {
-    if (!_programmaticJump) _userScrolled = true;
+  /// 普通进入：反序 ListView 的像素监听（offset 0 = 底部）
+  void _onPlainScrollPaging() {
+    if (_anchored || _pagingSuppressed || _loading) return;
+    if (!_plainScroll.hasClients) return;
+    final pos = _plainScroll.position;
+    if (pos.maxScrollExtent <= 0) return;
+    if (pos.pixels >= pos.maxScrollExtent - 400 && _hasOlder) {
+      _loadOlder();
+    } else if (pos.pixels <= 120 && _hasNewer) {
+      _loadNewer();
+    }
+  }
+
+  void _onPositionsChanged() {
+    if (!_anchored || _pagingSuppressed || _loading) return;
+    final positions = _itemPositions.itemPositions.value;
+    if (positions.isEmpty) return;
+    var minIdx = positions.first.index;
+    var maxIdx = positions.first.index;
+    for (final p in positions) {
+      if (p.index < minIdx) minIdx = p.index;
+      if (p.index > maxIdx) maxIdx = p.index;
+    }
+    final streamOffset = _streaming ? 1 : 0;
+    final msgMax = maxIdx - streamOffset;
+    final msgMin = minIdx - streamOffset;
+    if (msgMax >= _messages.length - 5 && _hasOlder) _loadOlder();
+    if (msgMin <= 1 && _hasNewer) _loadNewer();
   }
 
   @override
   void dispose() {
     _input.dispose();
-    _scroll.dispose();
+    _itemPositions.itemPositions.removeListener(_onPositionsChanged);
+    _plainScroll.removeListener(_onPlainScrollPaging);
+    _plainScroll.dispose();
     super.dispose();
   }
 
@@ -81,25 +145,138 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         if (c != null) members[mid] = c;
       }
     }
-    final msgs = g == null ? <ChatMessage>[] : await state.groupMessages(g.id);
+    final total = g == null ? 0 : await state.countMessagesForGroup(g.id);
+    // 单页大小 = max(30, 上下文轮数)
+    final eff0 = g == null
+        ? resolveSettings(state.settings)
+        : resolveGroup(state.settings, g);
+    _pageSize = eff0.contextTurns > _minPageSize ? eff0.contextTurns : _minPageSize;
+
+    int start;
+    int limit;
+    int? targetIdx;
+    if (g != null && widget.initialSearchTargetId != null) {
+      // 用数据库按同一排序重算索引，避免排序差异导致偏移
+      targetIdx = await state.indexOfMessageForGroup(g.id, widget.initialSearchTargetId!);
+      start = (targetIdx - _searchBefore).clamp(0, total);
+      limit = (targetIdx + _searchAfter + 1 - start).clamp(1, total - start);
+      _pagingSuppressUntil = DateTime.now().millisecondsSinceEpoch + 900;
+    } else {
+      limit = total < _pageSize ? total : _pageSize;
+      start = total - limit;
+    }
+    final msgs = (g == null || total == 0)
+        ? <ChatMessage>[]
+        : await state.messageSliceForGroup(g.id, start, limit);
+
     if (!mounted) return;
     setState(() {
       _group = g;
       _members = members;
-      _messages = msgs;
+      _messages = msgs.reversed.toList(); // 最新在前
+      _total = total;
+      _windowStart = start;
+      _searchReturnIndex =
+          targetIdx == null || msgs.isEmpty ? -1 : (start + msgs.length - 1 - targetIdx);
       _loading = false;
     });
-    _userScrolled = false;
-    if (widget.initialSearchTargetId != null) {
-      // 查找定位：不要自动滚到底部
-      _scrollToMessage(widget.initialSearchTargetId!);
-      return;
-    }
-    for (final ms in const [0, 50, 200]) {
-      Future.delayed(Duration(milliseconds: ms), () {
-        if (mounted && !_userScrolled) _jumpToBottom(animate: false);
+    if (targetIdx != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _scrollToIndex(_searchReturnIndex);
       });
     }
+  }
+
+  /// 加载更早的一页（追加到末尾 = 最老方向）
+  Future<void> _loadOlder() async {
+    if (_loadingOlder || !_hasOlder || _group == null) return;
+    _loadingOlder = true;
+    final state = context.read<AppState>();
+    final start = (_windowStart - _pageSize).clamp(0, _windowStart);
+    final limit = _windowStart - start;
+    final older = await state.messageSliceForGroup(_group!.id, start, limit);
+    if (!mounted) {
+      _loadingOlder = false;
+      return;
+    }
+    setState(() {
+      _messages = [..._messages, ...older.reversed];
+      _windowStart = start;
+      if (_searchReturnIndex >= 0) _searchReturnIndex += older.length;
+      _loadingOlder = false;
+    });
+  }
+
+  /// 加载更晚的一页（插入到开头 = 最新方向），保持视口锚点
+  Future<void> _loadNewer() async {
+    if (_loadingNewer || !_hasNewer || _group == null) return;
+    _loadingNewer = true;
+    final state = context.read<AppState>();
+    final offset = _windowStart + _messages.length;
+    final remain = _total - offset;
+    final limit = remain < _pageSize ? remain : _pageSize;
+
+    int anchorIndex = 0;
+    double anchorAlign = 0.0;
+    final positions = _itemPositions.itemPositions.value;
+    if (positions.isNotEmpty) {
+      var first = positions.first;
+      for (final p in positions) {
+        if (p.index < first.index) first = p;
+      }
+      anchorIndex = first.index;
+      anchorAlign = first.itemLeadingEdge;
+    }
+
+    final newer = await state.messageSliceForGroup(_group!.id, offset, limit);
+    if (!mounted) {
+      _loadingNewer = false;
+      return;
+    }
+    setState(() {
+      _messages = [...newer.reversed, ..._messages];
+      _loadingNewer = false;
+      if (_searchReturnIndex >= 0) _searchReturnIndex += newer.length;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        _itemScroll.jumpTo(
+          index: anchorIndex + newer.length,
+          alignment: anchorAlign.clamp(0.0, 0.99),
+        );
+      } catch (_) {}
+    });
+  }
+
+  /// 发送前确保处于最新窗口
+  Future<void> _ensureLatestWindow() async {
+    if (!_hasNewer || _group == null) return;
+    final state = context.read<AppState>();
+    final total = await state.countMessagesForGroup(_group!.id);
+    final limit = total < _pageSize ? total : _pageSize;
+    final start = total - limit;
+    final msgs = total == 0
+        ? <ChatMessage>[]
+        : await state.messageSliceForGroup(_group!.id, start, limit);
+    if (!mounted) return;
+    final wasAnchored = _anchored;
+    setState(() {
+      _messages = msgs.reversed.toList();
+      _total = total;
+      _windowStart = start;
+      _searchReturnIndex = -1;
+    });
+    if (!wasAnchored) {
+      _jumpToBottom(force: true);
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        _itemScroll.jumpTo(index: 0);
+      } catch (_) {}
+    });
   }
 
   ProviderConfig? _providerFor(Character c, AppState state) {
@@ -134,25 +311,48 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final text = _input.text.trim();
     if ((text.isEmpty && _attachments.isEmpty) || _streaming) return;
     final state = context.read<AppState>();
-    final g = _group;
+    var g = _group;
     if (g == null) return;
+    // 若正在查看历史窗口，先回到最新窗口
+    if (_hasNewer) {
+      await _ensureLatestWindow();
+      g = _group;
+      if (g == null) return;
+    }
 
     final id = DateTime.now().microsecondsSinceEpoch.toString();
     final content = _composeContent(text);
+    final atts = <Attachment>[];
+    for (final a in _attachments) {
+      if (a.isImage) {
+        final size = await imageSizeOf(a.path);
+        atts.add(Attachment(
+          type: 'image',
+          path: a.path,
+          name: a.name,
+          width: size?.$1 ?? 0,
+          height: size?.$2 ?? 0,
+        ));
+      } else {
+        atts.add(Attachment(type: 'file', path: a.path, name: a.name));
+      }
+    }
     final userMsg = ChatMessage(
       id: id,
       groupId: g.id,
       role: 'user',
       content: content,
+      attachments: atts,
       createdAt: DateTime.now().millisecondsSinceEpoch,
     );
     await state.insertMessage(userMsg);
     setState(() {
-      _messages.add(userMsg);
+      _messages.insert(0, userMsg); // 最新在前
+      _total += 1;
       _input.clear();
       _attachments.clear();
     });
-    _jumpToBottom();
+    _jumpToBottom(force: true);
 
     if (g.replyMode == 'designated') return;
 
@@ -161,11 +361,15 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
 
   /// 添加图片附件
   Future<void> _addImage() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.image, withData: false);
+    // compressionQuality: 0 关闭插件压缩，避免公共 Pictures 目录留副本（相册重复）
+    final r = await FilePicker.platform.pickFiles(
+        type: FileType.image, withData: false, compressionQuality: 0);
     if (r == null || r.files.isEmpty) return;
     final f = r.files.first;
-    final path = f.path ?? '';
+    var path = f.path ?? '';
     if (path.isEmpty) return;
+    path = await adoptPickedFile(path);
+    if (!mounted) return;
     setState(() => _attachments.add(PendingAttachment(path: path, name: f.name, isImage: true)));
   }
 
@@ -174,8 +378,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final r = await FilePicker.platform.pickFiles(type: FileType.any, withData: false);
     if (r == null || r.files.isEmpty) return;
     final f = r.files.first;
-    final path = f.path ?? '';
+    var path = f.path ?? '';
     if (path.isEmpty) return;
+    path = await adoptPickedFile(path);
+    if (!mounted) return;
     setState(() => _attachments.add(PendingAttachment(path: path, name: f.name, isImage: false)));
   }
 
@@ -224,6 +430,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
+  /// 每个角色本轮最多连续发几条（群设置里的"每角色最多回复 N 条"）
+  int _replyLimitOf(ChatGroup g) => g.maxReplies <= 0 ? 1 : g.maxReplies.clamp(1, 3);
+
   Future<void> _autoAll(AppState state, ChatGroup g) async {
     final members = _members.values.toList();
     if (members.isEmpty) return;
@@ -231,10 +440,13 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final mentioned = members.where((m) => last.contains(m.name)).toList();
     final rest = members.where((m) => !mentioned.contains(m)).toList();
     final order = [...mentioned, ...rest];
+    final limit = _replyLimitOf(g);
     for (final m in order) {
-      if (!mounted) return;
-      await _streamReply(state, g, m, m.id);
-      await Future.delayed(const Duration(milliseconds: 300));
+      for (var i = 0; i < limit; i++) {
+        if (!mounted) return;
+        await _streamReply(state, g, m, m.id);
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
     }
   }
 
@@ -244,14 +456,19 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     // 轮流：从上次起始位置之后开始
     int start = _turn % members.length;
     final order = [...members.sublist(start), ...members.sublist(0, start)];
+    // 一次请求判定全员是否开口（原来是每个角色各发一次"是/否"请求，
+    // 5 人群一条消息就要 5 次额外调用，又慢又费钱）
+    final picked = await _decideReplies(state, g, order);
+    final limit = _replyLimitOf(g);
     var replied = 0;
     for (final m in order) {
-      if (!mounted) return;
-      if (await _shouldReply(state, g, m)) {
+      if (!picked.contains(m.id)) continue;
+      for (var i = 0; i < limit; i++) {
+        if (!mounted) return;
         await _streamReply(state, g, m, m.id);
-        replied++;
         await Future.delayed(const Duration(milliseconds: 300));
       }
+      replied++;
     }
     _turn++;
     if (replied == 0 && order.isNotEmpty) {
@@ -260,26 +477,47 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
   }
 
-  Future<bool> _shouldReply(AppState state, ChatGroup g, Character character) async {
-    final provider = _providerFor(character, state);
-    if (provider == null) return false;
+  /// 一次调用决定本群这一轮由谁开口，返回角色 id 集合。
+  Future<Set<String>> _decideReplies(
+      AppState state, ChatGroup g, List<Character> members) async {
+    final provider = _providerFor(members.first, state);
+    if (provider == null) return <String>{};
     final last = _messages.isNotEmpty ? _messages.last.content : '';
+    final names = members.map((m) => m.name).join('、');
     try {
       final r = (await ApiClient().completeChat(
         baseUrl: provider.baseUrl,
         apiKey: provider.apiKey,
-        model: (character.model?.isNotEmpty ?? false) ? character.model! : provider.model,
+        model: provider.model,
         messages: [
           {
             'role': 'system',
-            'content': '你是「${character.name}」。有人刚在群里说话，根据你的性格判断你是否要开口回应。只回复：是 或 否。'
+            'content': '你是群聊调度器。群成员：$names。'
+                '根据每个人的性格判断谁适合回复刚发的这条消息。'
+                '严格只输出 JSON 数组，元素是应回复的角色名，例如 ["甲","乙"]；'
+                '没有人适合回复时输出 []。不要输出任何其他文字。',
           },
           {'role': 'user', 'content': last},
         ],
-      )).trim();
-      return r.contains('是');
+        temperature: 0.3,
+      ))
+          .trim();
+      final open = r.indexOf('[');
+      final close = r.lastIndexOf(']');
+      if (open < 0 || close <= open) return <String>{};
+      final list = jsonDecode(r.substring(open, close + 1));
+      final out = <String>{};
+      if (list is List) {
+        for (final e in list) {
+          final name = e?.toString().trim() ?? '';
+          for (final m in members) {
+            if (m.name == name) out.add(m.id);
+          }
+        }
+      }
+      return out;
     } catch (_) {
-      return false;
+      return <String>{};
     }
   }
 
@@ -295,7 +533,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Future<void> _deleteMessage(ChatMessage m) async {
     final state = context.read<AppState>();
     await state.deleteMessage(m.id);
-    setState(() => _messages.removeWhere((x) => x.id == m.id));
+    setState(() {
+      _messages.removeWhere((x) => x.id == m.id);
+      if (_total > 0) _total -= 1;
+    });
   }
 
   /// 删除该消息及其之后的所有消息，并同步删除记忆（取决于记忆模式）。
@@ -317,13 +558,17 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (ok != true || !mounted) return;
     final idx = _messages.indexWhere((x) => x.id == m.id);
     if (idx < 0) return;
-    final groupWhole = g.memoryMode == 'whole';
-    final owners = groupWhole
-        ? ['group_${g.id}']
-        : _members.values.map((c) => c.id).toList();
+    final owners =
+        _members.values.map((c) => state.groupMemoryOwner(g, c)).toSet().toList();
     await state.deleteMessagesFrom(null, g.id, m.createdAt, memoryOwners: owners);
-    setState(() => _messages = _messages.sublist(0, idx));
-    _jumpToBottom(animate: false);
+    setState(() {
+      // 删除该条及其后（更新）的消息；最新在前 → 保留比它更老的部分
+      final keep = idx + 1;
+      _total = _windowStart + (_messages.length - keep).clamp(0, _messages.length);
+      _messages = keep >= _messages.length ? <ChatMessage>[] : _messages.sublist(keep);
+      _searchReturnIndex = -1;
+    });
+    _jumpToBottom(animate: false, force: true);
   }
 
   Future<void> _editMessage(ChatMessage m, {bool isUser = false}) async {
@@ -366,23 +611,24 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final state = context.read<AppState>();
     final g = _group;
     if (g == null) return;
-    // 找到最后一条角色消息所属角色
+    // 最新在前：从索引 0 开始找最近一条角色消息
     ChatMessage? last;
-    for (int i = _messages.length - 1; i >= 0; i--) {
+    for (int i = 0; i < _messages.length; i++) {
       if (_messages[i].role == 'assistant' && _messages[i].senderCharacterId != null) {
         last = _messages[i];
         break;
       }
     }
-    if (last == null || !_members.containsKey(last!.senderCharacterId)) return;
+    if (last == null || !_members.containsKey(last.senderCharacterId)) return;
     final character = _members[last.senderCharacterId]!;
-    final histories = _messages.where((m) => m.role != 'system').toList();
+    final histories = _messages.where((m) => m.role != 'system').toList().reversed.toList();
     final gwb = g.worldbookIds.isEmpty
         ? <WorldbookEntry>[]
         : (await state.worldbookFor(null)).where((e) => g.worldbookIds.contains(e.id)).toList();
+    final memOwner = state.groupMemoryOwner(g, character);
     final groupWhole = g.memoryMode == 'whole';
-    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(character.id);
-    final groupMems = groupWhole ? await state.memoriesFor('group_${g.id}') : <MemoryItem>[];
+    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(memOwner);
+    final groupMems = groupWhole ? await state.memoriesFor(memOwner) : <MemoryItem>[];
     final payload = PromptBuilder.buildGroupMessages(
       character: character,
       eff: _eff,
@@ -392,7 +638,19 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       history: histories,
       groupNames: _members.values.map((m) => m.name).toList(),
       replyStyle: g.replyStyle,
+      extraPrompt: state.settings.systemPromptExtra,
     );
+    // 先把最后一条真实用户消息替换成多模态内容（图片/文件），
+    // 再追加"继续"指令。顺序反了会把指令本身替换成图片，
+    // 模型就会去回答图片而不是续写。
+    final lastUserIdx = payload.lastIndexWhere((e) => e['role'] == 'user');
+    if (lastUserIdx >= 0) {
+      final users = histories.where((m) => m.role == 'user').toList();
+      if (users.isNotEmpty && users.last.attachments.isNotEmpty) {
+        final rich = await buildUserContent(users.last, vision: true);
+        if (rich != null) payload[lastUserIdx] = {'role': 'user', 'content': rich};
+      }
+    }
     payload.add({
       'role': 'user',
       'content': '请接着你上一句话继续说下去，自然续写，不要重复。',
@@ -407,40 +665,61 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _streamReasoning = '';
     });
     _jumpToBottom();
+    final seq = ++_streamSeq;
     try {
-      await for (final delta in ApiClient().streamChat(
-        baseUrl: provider.baseUrl,
-        apiKey: provider.apiKey,
-        model: _replyModelFor(character, provider),
-        messages: payload,
-        temperature: 0.9,
-      )) {
-        if (!mounted) return;
-        if (delta.content.isNotEmpty) setState(() => _streamText += delta.content);
-        if (delta.reasoning.isNotEmpty) setState(() => _streamReasoning += delta.reasoning);
+      try {
+        await for (final delta in ApiClient().streamChat(
+          baseUrl: provider.baseUrl,
+          apiKey: provider.apiKey,
+          model: _replyModelFor(character, provider),
+          messages: payload,
+          temperature: 0.9,
+        )) {
+          if (!mounted) return;
+          if (delta.content.isNotEmpty) setState(() => _streamText += delta.content);
+          if (delta.reasoning.isNotEmpty) setState(() => _streamReasoning += delta.reasoning);
+        }
+      } on ApiException catch (e) {
+        if (mounted) setState(() => _streamText += '\n[错误] ${e.message}');
       }
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _streamText += '\n[错误] ${e.message}');
+      final asst = ChatMessage(
+        id: id,
+        groupId: g.id,
+        role: 'assistant',
+        senderCharacterId: character.id,
+        content: _streamText.trim(),
+        reasoning: _streamReasoning.trim(),
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      await state.insertMessage(asst);
+      if (mounted) {
+        setState(() {
+          _messages.insert(0, asst); // 最新在前
+          _total += 1;
+        });
+      }
+      _jumpToBottom();
+    } catch (e) {
+      if (mounted && seq == _streamSeq) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('续写失败：$e')));
+      }
+    } finally {
+      if (seq == _streamSeq) _endStreaming();
     }
-    final asst = ChatMessage(
-      id: id,
-      groupId: g.id,
-      role: 'assistant',
-      senderCharacterId: character.id,
-      content: _streamText.trim(),
-      reasoning: _streamReasoning.trim(),
-      createdAt: DateTime.now().millisecondsSinceEpoch,
-    );
-    await state.insertMessage(asst);
-    if (mounted) {
-      setState(() {
-        _messages.add(asst);
-        _streaming = false;
-        _streamText = '';
-        _streamReasoning = '';
-      });
+  }
+
+  /// 复位流式状态：成功 / 失败 / 异常都必须走到这里
+  void _endStreaming() {
+    if (!mounted) {
+      _streaming = false;
+      return;
     }
-    _jumpToBottom();
+    setState(() {
+      _streaming = false;
+      _streamText = '';
+      _streamReasoning = '';
+    });
   }
 
   Future<void> _regenerateMessage(ChatMessage m) async {
@@ -450,7 +729,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final character = _members[m.senderCharacterId];
     if (character == null) return;
     await state.deleteMessage(m.id);
-    setState(() => _messages.removeWhere((x) => x.id == m.id));
+    setState(() {
+      _messages.removeWhere((x) => x.id == m.id);
+      if (_total > 0) _total -= 1;
+    });
     await _streamReply(state, g, character, character.id);
   }
 
@@ -472,7 +754,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       },
     ];
     for (final m in _messages) {
-      payload.add({'role': m.role == 'user' ? 'user' : 'assistant', 'content': m.content});
+      payload.add({
+        'role': m.role == 'user' ? 'user' : 'assistant',
+        'content': contentForModel(m),
+      });
     }
     try {
       setState(() {
@@ -602,24 +887,33 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (_streaming) return;
     final provider = _providerFor(character, state);
     if (provider == null) {
-      await state.insertMessage(ChatMessage(
+      final note = ChatMessage(
         id: DateTime.now().microsecondsSinceEpoch.toString(),
         groupId: g.id,
         role: 'assistant',
         senderCharacterId: senderCharId,
         content: '（$character.name 未配置接口）',
         createdAt: DateTime.now().millisecondsSinceEpoch,
-      ));
+      );
+      await state.insertMessage(note);
+      // 同步到本地列表，否则提示只进了数据库、界面要重进群才看得到
+      if (mounted) {
+        setState(() {
+          _messages.insert(0, note);
+          _total += 1;
+        });
+      }
       return;
     }
-    final histories = _messages.where((m) => m.role != 'system').toList();
+    final histories = _messages.where((m) => m.role != 'system').toList().reversed.toList();
     final gwb = g.worldbookIds.isEmpty
         ? <WorldbookEntry>[]
         : (await state.worldbookFor(null)).where((e) => g.worldbookIds.contains(e.id)).toList();
     // 记忆模式：whole=群整体；separate/synced=按角色独立
+    final memOwner = state.groupMemoryOwner(g, character);
     final bool groupWhole = g.memoryMode == 'whole';
-    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(character.id);
-    final groupMems = groupWhole ? await state.memoriesFor('group_${g.id}') : <MemoryItem>[];
+    final charMems = groupWhole ? <MemoryItem>[] : await state.memoriesFor(memOwner);
+    final groupMems = groupWhole ? await state.memoriesFor(memOwner) : <MemoryItem>[];
     final payload = PromptBuilder.buildGroupMessages(
       character: character,
       eff: _eff,
@@ -629,7 +923,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       history: histories,
       groupNames: _members.values.map((m) => m.name).toList(),
       replyStyle: g.replyStyle,
+      extraPrompt: state.settings.systemPromptExtra,
     );
+
+    // 最后一条用户消息：图片直接发给多模态模型 / 读取文本文件内容
+    final lastUserIdx = payload.lastIndexWhere((e) => e['role'] == 'user');
+    var usedRich = false;
+    var textOnly = '';
+    if (lastUserIdx >= 0) {
+      final users = histories.where((m) => m.role == 'user').toList();
+      if (users.isNotEmpty && users.last.attachments.isNotEmpty) {
+        textOnly = contentForModel(users.last);
+        final rich = await buildUserContent(users.last, vision: true)
+            .timeout(const Duration(seconds: 25), onTimeout: () => null);
+        if (rich != null) {
+          payload[lastUserIdx] = {'role': 'user', 'content': rich};
+          usedRich = rich is List;
+        }
+      }
+    }
 
     final id = DateTime.now().microsecondsSinceEpoch.toString();
     setState(() {
@@ -640,45 +952,100 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     });
     _jumpToBottom();
 
+    final seq = ++_streamSeq;
     try {
-      await for (final delta in ApiClient().streamChat(
-        baseUrl: provider.baseUrl,
-        apiKey: provider.apiKey,
-        model: _replyModelFor(character, provider),
-        messages: payload,
-        temperature: 0.9,
-      )) {
-        if (!mounted) return;
-        if (delta.content.isNotEmpty) setState(() => _streamText += delta.content);
-        if (delta.reasoning.isNotEmpty) setState(() => _streamReasoning += delta.reasoning);
+      Future<String?> run({bool stream = true}) async {
+        try {
+          if (stream) {
+            await for (final delta in ApiClient()
+                .streamChat(
+                  baseUrl: provider.baseUrl,
+                  apiKey: provider.apiKey,
+                  model: _replyModelFor(character, provider),
+                  messages: payload,
+                  temperature: 0.9,
+                  maxTokens: usedRich ? 4096 : null,
+                )
+                .timeout(Duration(seconds: usedRich ? 25 : 60))) {
+              if (!mounted) return null;
+              if (delta.content.isNotEmpty) setState(() => _streamText += delta.content);
+              if (delta.reasoning.isNotEmpty) setState(() => _streamReasoning += delta.reasoning);
+            }
+            return null;
+          }
+          // 非流式兜底：正文与思考一起取回
+          final r = await ApiClient()
+              .completeChatFull(
+                baseUrl: provider.baseUrl,
+                apiKey: provider.apiKey,
+                model: _replyModelFor(character, provider),
+                messages: payload,
+                temperature: 0.9,
+                maxTokens: 4096,
+              )
+              .timeout(const Duration(seconds: 90));
+          if (!mounted) return null;
+          setState(() {
+            _streamText += r.content;
+            _streamReasoning += r.reasoning;
+          });
+          return null;
+        } catch (e) {
+          return e is ApiException ? e.message : e.toString();
+        }
       }
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _streamText += '\n[错误] ${e.message}');
-    }
 
-    final finalText = _streamText.trim();
-    final asst = ChatMessage(
-      id: id,
-      groupId: g.id,
-      role: 'assistant',
-      senderCharacterId: senderCharId,
-      content: finalText,
-      reasoning: _streamReasoning.trim(),
-      createdAt: DateTime.now().millisecondsSinceEpoch,
-    );
-    await state.insertMessage(asst);
-    if (mounted) {
-      setState(() {
-        _messages.add(asst);
-        _streaming = false;
+      var errText = await run();
+      if (!mounted) return;
+      // 带图流式失败（首包超时 / 服务端不支持流式多模态）→ 非流式重发，仍带图
+      if (errText != null && usedRich) {
         _streamText = '';
         _streamReasoning = '';
-      });
+        setState(() {});
+        errText = await run(stream: false);
+      }
+      // 仍失败 → 去掉附件，用纯文字重试
+      if (errText != null && textOnly.isNotEmpty) {
+        payload[lastUserIdx] = {'role': 'user', 'content': textOnly};
+        _streamText = '';
+        _streamReasoning = '';
+        setState(() {});
+        errText = await run();
+      }
+      if (errText != null && mounted) {
+        setState(() => _streamText += '\n[错误] $errText');
+      }
+
+      final finalText = _streamText.trim();
+      final asst = ChatMessage(
+        id: id,
+        groupId: g.id,
+        role: 'assistant',
+        senderCharacterId: senderCharId,
+        content: finalText,
+        reasoning: _streamReasoning.trim(),
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      await state.insertMessage(asst);
+      if (mounted) {
+        setState(() {
+          _messages.insert(0, asst); // 最新在前
+          _total += 1;
+        });
+      }
+      _jumpToBottom();
+    } catch (e) {
+      // 兜底：未预期异常不能把群聊卡在"等待模型响应…"
+      if (mounted && seq == _streamSeq) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('生成失败：$e')));
+      }
+    } finally {
+      if (seq == _streamSeq) _endStreaming();
     }
-    _jumpToBottom();
-    // 自动长记忆：按"角色回复条数"计数触发（避免开场白/用户消息导致奇偶错位）
+    // 自动长记忆：按"角色回复条数"计数（查库，不受窗口加载影响）
     final every = g.autoMemoryEvery > 0 ? g.autoMemoryEvery : state.settings.autoMemoryEvery;
-    final turns = _messages.where((m) => m.role == 'assistant').length;
+    final turns = await state.countAssistantForGroup(g.id);
     if (every > 0 && turns > 0 && turns % every == 0 && state.settings.memoryEnabled) {
       _autoMemory(state, g);
     }
@@ -687,7 +1054,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   Future<void> _autoMemory(AppState state, ChatGroup g) async {
     final provider = state.getProviderById(null);
     if (provider == null) return;
-    final history = _messages.where((m) => m.role != 'system').toList();
+    final history = _messages.where((m) => m.role != 'system').toList().reversed.toList();
     if (history.isEmpty) return;
     final tail = history.length > 8 ? history.sublist(history.length - 8) : history;
     // 整理成一段文本，避免模型把它当成对话续写
@@ -744,7 +1111,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         if (text == null || text.isEmpty) continue;
         await state.addMemory(MemoryItem(
           id: '${DateTime.now().microsecondsSinceEpoch}_${m.id}',
-          characterId: m.id,
+          // separate=群内独立；synced=与私聊共用角色记忆
+          characterId: state.groupMemoryOwner(g, m),
           content: text,
         ));
         saved++;
@@ -770,7 +1138,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
             if (MemoryHelper.isValid(one)) {
               await state.addMemory(MemoryItem(
                 id: '${DateTime.now().microsecondsSinceEpoch}_${m.id}',
-                characterId: m.id,
+                characterId: state.groupMemoryOwner(g, m),
                 content: MemoryHelper.clean(one),
               ));
             }
@@ -800,58 +1168,91 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     return {};
   }
 
-  void _jumpToBottom({bool animate = true}) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      final target = _scroll.position.maxScrollExtent;
-      _programmaticJump = true;
-      if (animate) {
-        _scroll.animateTo(target,
-            duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
-      } else {
-        _scroll.jumpTo(target);
+  /// 回到底部（最新一条）
+  void _jumpToBottom({bool animate = true, bool force = false, int attempt = 0}) {
+    // 普通进入：和私聊一样用普通 ListView，
+    // 反序列表 offset 0 = 底部；正序（内容不满一屏）时无需滚动
+    if (!_anchored) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (!_plainScroll.hasClients && attempt < 8) {
+          Future.delayed(Duration(milliseconds: 50 + attempt * 40), () {
+            if (mounted) _jumpToBottom(animate: animate, force: force, attempt: attempt + 1);
+          });
+          return;
+        }
+        if (!_plainScroll.hasClients) return;
+        final pos = _plainScroll.position;
+        if (_contentFits) {
+          // 正序列表：内容本就不满一屏；若这一帧刚好溢出，先贴底，下一帧会切回反序
+          if (pos.maxScrollExtent > 0.5 && pos.pixels < pos.maxScrollExtent - 0.5) {
+            pos.jumpTo(pos.maxScrollExtent);
+          }
+          return;
+        }
+        if (pos.pixels > 0.5) {
+          if (animate) {
+            pos.animateTo(0,
+                duration: const Duration(milliseconds: 160), curve: Curves.easeOut);
+          } else {
+            pos.jumpTo(0);
+          }
+        }
+      });
+      return;
+    }
+    if (!force) {
+      final positions = _itemPositions.itemPositions.value;
+      if (positions.isNotEmpty) {
+        var minIdx = positions.first.index;
+        for (final p in positions) {
+          if (p.index < minIdx) minIdx = p.index;
+        }
+        if (minIdx > 2) return;
       }
-      _programmaticJump = false;
-    });
-  }
-
-  /// 查找聊天记录后滚到某条消息并高亮。
-  void _scrollToMessage(String id) {
-    final idx = _messages.indexWhere((m) => m.id == id);
-    if (idx < 0 || !mounted) return;
-    setState(() => _searchReturnIndex = idx);
-    _scrollToIndex(idx);
-  }
-
-  /// 滚动到第 idx 条消息：优先 GlobalKey + ensureVisible，未构建时估算跳转后重试。
-  void _scrollToIndex(int idx, {int attempt = 0}) {
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || idx < 0 || idx >= _messages.length) return;
-      final key = _msgKeys[_messages[idx].id];
-      final ctx = key?.currentContext;
-      if (ctx != null) {
-        _programmaticJump = true;
-        Scrollable.ensureVisible(
-          ctx,
-          alignment: 0.3,
-          duration: const Duration(milliseconds: 280),
-          curve: Curves.easeOut,
-        ).whenComplete(() {
-          _programmaticJump = false;
-          _userScrolled = false;
+      if (!mounted) return;
+      if (!_itemScroll.isAttached && attempt < 8) {
+        Future.delayed(Duration(milliseconds: 50 + attempt * 40), () {
+          if (mounted) {
+            _jumpToBottom(animate: animate, force: true, attempt: attempt + 1);
+          }
         });
         return;
       }
-      if (!_scroll.hasClients || attempt >= 8) return;
-      final max = _scroll.position.maxScrollExtent;
-      final est = _messages.isEmpty
-          ? 0.0
-          : (max * (idx / _messages.length)).clamp(0.0, max);
-      _programmaticJump = true;
-      _scroll.jumpTo(est);
-      _programmaticJump = false;
-      Future.delayed(Duration(milliseconds: 40 + attempt * 20), () {
-        if (mounted) _scrollToIndex(idx, attempt: attempt + 1);
+      try {
+        if (animate) {
+          _itemScroll.scrollTo(
+            index: 0,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOut,
+          );
+        } else {
+          _itemScroll.jumpTo(index: 0);
+        }
+      } catch (_) {}
+    });
+  }
+
+  /// 查找聊天记录后定位到某条消息（本地索引）：滑动到居中
+  void _scrollToIndex(int idx) {
+    if (idx < 0 || idx >= _messages.length) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      try {
+        _itemScroll.jumpTo(index: idx, alignment: 0.0);
+      } catch (_) {}
+      Future.delayed(const Duration(milliseconds: 16), () {
+        if (!mounted) return;
+        try {
+          _itemScroll.scrollTo(
+            index: idx,
+            alignment: 0.5,
+            duration: const Duration(milliseconds: 250),
+            curve: Curves.easeOut,
+          );
+        } catch (_) {}
       });
     });
   }
@@ -878,8 +1279,13 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       ),
     );
     if (c != null && mounted) {
-      await Navigator.push(context,
-          MaterialPageRoute(builder: (_) => MemoryScreen(characterId: c.id, memoryModeLabel: _memoryModeLabel(g.memoryMode))));
+      await Navigator.push(
+          context,
+          MaterialPageRoute(
+              builder: (_) => MemoryScreen(
+                  characterId: state.groupMemoryOwner(g, c),
+                  historyGroupId: g.id,
+                  memoryModeLabel: _memoryModeLabel(g.memoryMode))));
       if (mounted) setState(() {});
     }
   }
@@ -1031,85 +1437,145 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
+  /// 消息列表：索引锚定 + reverse，索引 0 = 最新（底部）
   Widget _messageList(AppState state, ChatGroup g, double topInset) {
-    final showCharAvatar = _hideCharAvatar == null ? true : !_hideCharAvatar;
-    final showUserAvatar = _hideUserAvatar == null ? true : !_hideUserAvatar;
-    final last = _messages.isNotEmpty ? _messages.length - 1 : -1;
+    final showCharAvatar = _hideCharAvatar == null
+        ? state.settings.showCharAvatar
+        : !_hideCharAvatar!;
+    final showUserAvatar = _hideUserAvatar == null
+        ? state.settings.showUserAvatar
+        : !_hideUserAvatar!;
+    final msgCount = _messages.length;
     final showBanner = _searchReturnIndex >= 0;
-    final bannerOffset = showBanner ? 1 : 0;
-    return ListView.builder(
-      controller: _scroll,
-      padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
-      itemCount: bannerOffset + _messages.length + (_streaming ? 1 : 0),
-      itemBuilder: (context, i) {
-        if (showBanner && i == 0) return _searchReturnBanner();
-        final idx = i - bannerOffset;
-        if (idx < _messages.length) {
-          final m = _messages[idx];
-          final foot = (idx == last && !_streaming) ? _actionFooter(state, m) : null;
-          if (m.role == 'user') {
-            return KeyedSubtree(
-              key: _msgKeys.putIfAbsent(m.id, () => GlobalKey()),
-              child: MessageBubble(
-                message: m,
-                isUser: true,
-                avatar: buildUserAvatar(context, state.settings, 34),
-                senderName: state.settings.personaName,
-                showAvatar: showUserAvatar,
-                footer: foot,
-                bubbleColor: parseHexColor(state.settings.bubbleSelfColor),
-                bubbleOpacity: state.settings.bubbleOpacity,
-                fontScale: state.settings.fontSize,
-                highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
-                onDeleteFromHere: () => _deleteFromHere(m),
-              ),
-            );
+    final streamOffset = _streaming ? 1 : 0;
+
+    Widget itemAt(int i) {
+        // 视觉最底部：流式输出气泡
+        if (streamOffset == 1 && i == 0) {
+          Character? sender;
+          for (final c in _members.values) {
+            if (c.name == _streamSender) {
+              sender = c;
+              break;
+            }
           }
-          final sender = m.senderCharacterId != null ? _members[m.senderCharacterId] : null;
-          return KeyedSubtree(
-            key: _msgKeys.putIfAbsent(m.id, () => GlobalKey()),
-            child: MessageBubble(
-              message: m,
-              isUser: false,
-              avatar: sender != null ? buildCharacterAvatar(context, sender, 34) : null,
-              senderName: sender?.name ?? '?',
-              showAvatar: showCharAvatar,
-              footer: foot,
-              topContent: m.reasoning.trim().isNotEmpty ? ThinkingToggle(reasoning: m.reasoning) : null,
-              bubbleColor: parseHexColor(state.settings.bubbleCharColor),
-              bubbleOpacity: state.settings.bubbleOpacity,
-              fontScale: state.settings.fontSize,
-              highlight: _searchReturnIndex >= 0 && idx == _searchReturnIndex,
-              onDeleteFromHere: () => _deleteFromHere(m),
-            ),
+          final st = ChatMessage(
+            id: 'st', role: 'assistant', content: _streamText, createdAt: 0,
+            groupId: g.id, senderCharacterId: sender?.id,
+          );
+          final streamTop = _streamReasoning.isNotEmpty && state.settings.showThinking
+              ? ThinkingToggle(reasoning: _streamReasoning)
+              : const ThinkingIndicator();
+          return MessageBubble(
+            message: st,
+            isUser: false,
+            avatar: sender != null ? buildCharacterAvatar(context, sender, 34) : null,
+            senderName: _streamSender,
+            showAvatar: showCharAvatar,
+            isCurrent: true,
+            fontScale: state.settings.fontSize,
+            topContent: streamTop,
           );
         }
-        Character? sender;
-        for (final c in _members.values) {
-          if (c.name == _streamSender) {
-            sender = c;
-            break;
-          }
+        final k = i - streamOffset;
+        // 视觉最顶部：查找返回条
+        if (showBanner && k == msgCount) return _searchReturnBanner();
+        if (k < 0 || k >= msgCount) return const SizedBox.shrink();
+        final m = _messages[k];
+        final foot = (k == 0 && !_streaming) ? _actionFooter(state, m) : null;
+        if (m.role == 'user') {
+          return MessageBubble(
+            message: m,
+            isUser: true,
+            avatar: buildUserAvatar(context, state.settings, 34),
+            senderName: state.settings.personaName,
+            showAvatar: showUserAvatar,
+            footer: foot,
+            bubbleColor: parseHexColor(state.settings.bubbleSelfColor),
+            bubbleOpacity: state.settings.bubbleOpacity,
+            fontScale: state.settings.fontSize,
+            highlight: _searchReturnIndex >= 0 && k == _searchReturnIndex,
+            onDeleteFromHere: () => _deleteFromHere(m),
+          );
         }
-        final st = ChatMessage(
-          id: 'st', role: 'assistant', content: _streamText, createdAt: 0,
-          groupId: g.id, senderCharacterId: sender?.id,
-        );
-        final streamTop = _streamReasoning.isNotEmpty
-            ? ThinkingToggle(reasoning: _streamReasoning)
-            : (_streaming ? const ThinkingIndicator() : null);
+        final sender = m.senderCharacterId != null ? _members[m.senderCharacterId] : null;
         return MessageBubble(
-          message: st,
+          message: m,
           isUser: false,
           avatar: sender != null ? buildCharacterAvatar(context, sender, 34) : null,
-          senderName: _streamSender,
+          senderName: sender?.name ?? '?',
           showAvatar: showCharAvatar,
-          isCurrent: true,
+          footer: foot,
+          topContent: m.reasoning.trim().isNotEmpty && state.settings.showThinking
+              ? ThinkingToggle(reasoning: m.reasoning)
+              : null,
+          bubbleColor: parseHexColor(state.settings.bubbleCharColor),
+          bubbleOpacity: state.settings.bubbleOpacity,
           fontScale: state.settings.fontSize,
-          topContent: streamTop,
+          highlight: _searchReturnIndex >= 0 && k == _searchReturnIndex,
+          onDeleteFromHere: () => _deleteFromHere(m),
         );
-      },
+    }
+
+    final itemCount = msgCount + streamOffset + (showBanner ? 1 : 0);
+
+    // 与私聊完全同一套做法：
+    // - 内容不满一屏 → 正序 ListView，顶部对齐（空白落在下方，和微信一致）
+    // - 内容超过一屏 → 反序 ListView（offset 0 = 视觉底部，发消息/流式自动贴底）
+    // 反序列表在内容不足一屏时会把内容钉在底部、空白全在上方 —— 那就是"上方空白"。
+    // 只有"查找聊天记录后定位"才用索引锚定列表（需要按条目定位）。
+    if (!_anchored) {
+      _syncGroupFit();
+      if (_contentFits) {
+        return ListView.builder(
+          controller: _plainScroll,
+          padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
+          itemCount: itemCount,
+          itemBuilder: (context, i) {
+            // 正序：索引 0 = 最顶部（最老的一条）
+            return itemAt(itemCount - 1 - i);
+          },
+        );
+      }
+      return ListView.builder(
+        controller: _plainScroll,
+        reverse: true, // 反序：offset 0 就是视觉底部
+        padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
+        itemCount: itemCount,
+        itemBuilder: (context, i) => itemAt(i),
+      );
+    }
+
+    return ScrollablePositionedList.builder(
+      itemScrollController: _itemScroll,
+      itemPositionsListener: _itemPositions,
+      reverse: true,
+      padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
+      itemCount: itemCount,
+      itemBuilder: (context, i) => itemAt(i),
     );
+  }
+
+  /// 内容是否不满一屏：决定列表方向
+  bool _contentFits = false;
+
+  /// 按"内容是否满一屏"切换列表方向（与私聊同一套判断）：
+  /// - 不满一屏 → 正序列表，顶部对齐（空白在下方）
+  /// - 满一屏   → 反序列表，offset 0 即底部
+  /// 两种方向的 0 偏移含义不同，所以切换后必须显式归零
+  ///（正序 = 顶部，反序 = 底部，刚好都是 0）。
+  void _syncGroupFit() {
+    if (_anchored || _loading) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_plainScroll.hasClients) return;
+      final fits = _plainScroll.position.maxScrollExtent <= 0.5;
+      if (fits == _contentFits) return;
+      setState(() => _contentFits = fits);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_plainScroll.hasClients) return;
+        _plainScroll.jumpTo(0);
+      });
+    });
   }
 
   Widget _searchReturnBanner() {
@@ -1209,7 +1675,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                 SwitchListTile(
                   dense: true,
                   title: const Text('显示角色头像'),
-                  value: !_hideCharAvatar,
+                  // 未单独设置过时跟随主设置
+                  value: _hideCharAvatar == null
+                      ? state.settings.showCharAvatar
+                      : !_hideCharAvatar!,
                   onChanged: (v) {
                     setState(() => _hideCharAvatar = !v);
                     sheetSetState(() {});
@@ -1220,7 +1689,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
                 SwitchListTile(
                   dense: true,
                   title: const Text('显示我的头像'),
-                  value: !_hideUserAvatar,
+                  value: _hideUserAvatar == null
+                      ? state.settings.showUserAvatar
+                      : !_hideUserAvatar!,
                   onChanged: (v) {
                     setState(() => _hideUserAvatar = !v);
                     sheetSetState(() {});
@@ -1235,8 +1706,9 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     );
   }
 
-  bool _hideCharAvatar = false;
-  bool _hideUserAvatar = false;
+  // null = 跟随设置里的全局开关；非 null 是本群的临时覆盖
+  bool? _hideCharAvatar;
+  bool? _hideUserAvatar;
 
   Future<void> _warnHideAvatar() async {
     final ok = await showDialog<bool>(
@@ -1346,51 +1818,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   }
 }
 
-class _ReasoningCard extends StatefulWidget {
-  final String reasoning;
-  const _ReasoningCard({required this.reasoning});
-  @override
-  State<_ReasoningCard> createState() => _ReasoningCardState();
-}
 
-class _ReasoningCardState extends State<_ReasoningCard> {
-  bool _open = false;
-  @override
-  Widget build(BuildContext context) {
-    if (widget.reasoning.trim().isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 4, 60, 0),
-      child: Card(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        child: InkWell(
-          onTap: () => setState(() => _open = !_open),
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.psychology, size: 16),
-                    const SizedBox(width: 6),
-                    Text(_open ? '收起思考' : '思考过程'),
-                    const Spacer(),
-                    Icon(_open ? Icons.expand_less : Icons.expand_more, size: 18),
-                  ],
-                ),
-                if (_open)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Text(widget.reasoning, style: const TextStyle(fontSize: 12, height: 1.4)),
-                  ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
 
 class _GroupModelSheet extends StatefulWidget {
   final ChatGroup group;

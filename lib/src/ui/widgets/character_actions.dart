@@ -124,7 +124,6 @@ Future<void> _exportCharacterCard(BuildContext context, AppState state, Characte
   try {
     final gwb = await state.worldbookFor(null);
     final selected = gwb.where((e) => c.worldbookIds.contains(e.id)).toList();
-    final jsonStr = CharacterCardService.toV2Json(c, worldbook: selected);
     final fmt = await showDialog<String>(
       context: context,
       builder: (d) => SimpleDialog(
@@ -147,6 +146,39 @@ Future<void> _exportCharacterCard(BuildContext context, AppState state, Characte
       ),
     );
     if (fmt == null || !context.mounted) return;
+
+    // 是否包含聊天记录
+    var includeChat = false;
+    final msgs = <ChatMessage>[];
+    final sessions = await state.sessionsFor(c.id);
+    if (sessions.isNotEmpty) {
+      final all = <ChatMessage>[];
+      for (final s in sessions) {
+        all.addAll(await state.messagesFor(s.id));
+      }
+      all.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      if (all.isNotEmpty && context.mounted) {
+        final choice = await showDialog<bool>(
+          context: context,
+          builder: (d) => AlertDialog(
+            title: const Text('包含聊天记录？'),
+            content: Text('共 ${all.length} 条消息，会写入角色卡的扩展字段（其他前端会忽略，不影响使用）。'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('不包含')),
+              TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('包含')),
+            ],
+          ),
+        );
+        includeChat = choice == true;
+        if (includeChat) msgs.addAll(all);
+      }
+    }
+    final jsonStr = CharacterCardService.toV2Json(
+      c,
+      worldbook: selected,
+      chatMessages: msgs,
+    );
+    if (!context.mounted) return;
 
     if (fmt == 'json') {
       final path = await FilePicker.platform.saveFile(
@@ -189,7 +221,8 @@ Future<void> _exportCharacterCard(BuildContext context, AppState state, Characte
       }
     } else {
       // 另选图片
-      final r = await FilePicker.platform.pickFiles(type: FileType.image, withData: true);
+      final r = await FilePicker.platform.pickFiles(
+          type: FileType.image, withData: true, compressionQuality: 0);
       if (r == null || r.files.isEmpty) return;
       final f = r.files.first;
       srcBytes = f.bytes;

@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/models.dart';
 import '../services/api_client.dart';
@@ -10,7 +11,7 @@ import 'worldbook_screen.dart';
 import 'usage_help_screen.dart';
 import 'theme.dart';
 import '../utils/colors.dart';
-import '../utils/file_utils.dart';
+import '../utils/file_adopt.dart';
 import 'widgets/color_picker.dart';
 import 'avatar_crop_screen.dart';
 
@@ -36,6 +37,7 @@ class SettingsScreen extends StatelessWidget {
           _Section('你的身份'),
           _PersonaSection(),
           _AvatarSection(),
+          _ShowAvatarSection(),
           Divider(),
           _Section('对话与记忆'),
           _ChatSettingsSection(),
@@ -366,10 +368,17 @@ class _ThemeSectionState extends State<_ThemeSection> {
                     )
                   : null,
               onTap: () async {
-                final r = await FilePicker.platform.pickFiles(type: FileType.image);
+                // compressionQuality:0 —— 禁用 file_picker 默认压缩，
+                // 否则它会把压缩图写进公共 Pictures 目录，相册里每次都会多一张
+                final r = await FilePicker.platform
+                    .pickFiles(type: FileType.image, compressionQuality: 0);
                 if (r != null && r.files.isNotEmpty) {
+                  var path = r.files.first.path ?? '';
+                  if (path.isEmpty) return;
+                  path = await adoptPickedFile(path);
+                  if (!context.mounted) return;
                   await context.read<AppState>()
-                      .updateSettings(s.copyWith(chatBackground: r.files.first.path ?? ''));
+                      .updateSettings(s.copyWith(chatBackground: path));
                 }
               },
             ),
@@ -471,10 +480,14 @@ class _AvatarSectionState extends State<_AvatarSection> {
         title: const Text('我的头像'),
         subtitle: Text(s.userAvatar.isEmpty ? '未设置' : '已设置'),
         onTap: () async {
-          final r = await FilePicker.platform.pickFiles(type: FileType.image);
+          // 同上：禁用插件压缩，避免相册重复
+          final r = await FilePicker.platform
+              .pickFiles(type: FileType.image, compressionQuality: 0);
           if (r != null && r.files.isNotEmpty) {
-            final path = r.files.first.path ?? '';
+            var path = r.files.first.path ?? '';
             if (path.isEmpty) return;
+            path = await adoptPickedFile(path);
+            if (!context.mounted) return;
             final cropped = await Navigator.push<String>(context,
                 MaterialPageRoute(builder: (_) => AvatarCropScreen(imagePath: path)));
             if (cropped != null) {
@@ -565,32 +578,87 @@ class _ChatSettingsSectionState extends State<_ChatSettingsSection> {
               value: s.realSense,
               onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(realSense: v)),
             ),
+            // 图片默认直接发给模型（多模态）；纯文本模型会自动降级为文字描述重试
             SwitchListTile(
               dense: true,
-              title: const Text('记忆达上限自动删除'),
+              title: const Text('记忆达上限自动压缩'),
+              subtitle: const Text('达上限时压缩最老的记忆，置顶记忆不受影响'),
               value: s.memoryAutoPrune,
               onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(memoryAutoPrune: v)),
             ),
-            if (s.memoryAutoPrune)
+            if (s.memoryAutoPrune) ...[
               Row(
                 children: [
                   const Text('记忆上限'),
                   const Spacer(),
                   SizedBox(
-                    width: 160,
+                    width: 150,
                     child: Slider(
-                      value: s.memoryLimit.toDouble().clamp(50, 2000),
-                      min: 50,
-                      max: 2000,
-                      divisions: 39,
+                      value: s.memoryLimit.toDouble().clamp(10, 999),
+                      min: 10,
+                      max: 999,
+                      divisions: 989,
                       label: '${s.memoryLimit}',
                       onChanged: (v) => context.read<AppState>()
                           .updateSettings(s.copyWith(memoryLimit: v.round())),
                     ),
                   ),
-                  Text('${s.memoryLimit}'),
+                  SizedBox(width: 38, child: Text('${s.memoryLimit}')),
                 ],
               ),
+              Row(
+                children: [
+                  const Text('压缩数量比'),
+                  const Spacer(),
+                  SizedBox(
+                    width: 150,
+                    child: Slider(
+                      value: s.memoryCompressCountRatio.clamp(0.1, 1.0),
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 18,
+                      label: '${(s.memoryCompressCountRatio * 100).round()}%',
+                      onChanged: (v) => context.read<AppState>().updateSettings(
+                          s.copyWith(memoryCompressCountRatio: (v * 100).round() / 100)),
+                    ),
+                  ),
+                  SizedBox(
+                      width: 38,
+                      child: Text('${(s.memoryCompressCountRatio * 100).round()}%')),
+                ],
+              ),
+              const Padding(
+                padding: EdgeInsets.only(left: 4, bottom: 6),
+                child: Text('记忆满时，取最老的这一比例去压缩。例如 20%：100 条时压缩最老的 20 条。',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              ),
+              Row(
+                children: [
+                  const Text('压缩比例'),
+                  const Spacer(),
+                  SizedBox(
+                    width: 150,
+                    child: Slider(
+                      value: s.memoryCompressKeepRatio.clamp(0.1, 1.0),
+                      min: 0.1,
+                      max: 1.0,
+                      divisions: 18,
+                      label: '${(s.memoryCompressKeepRatio * 100).round()}%',
+                      onChanged: (v) => context.read<AppState>().updateSettings(
+                          s.copyWith(memoryCompressKeepRatio: (v * 100).round() / 100)),
+                    ),
+                  ),
+                  SizedBox(
+                      width: 38,
+                      child: Text('${(s.memoryCompressKeepRatio * 100).round()}%')),
+                ],
+              ),
+              const Padding(
+                padding: EdgeInsets.only(left: 4, bottom: 6),
+                child: Text('被压缩的那批记忆里，压缩掉多少。例如 50%：20 条压缩成 10 条；100% 则直接删除。',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+              ),
+            ],
             Row(
               children: [
                 const Text('自动记忆间隔'),
@@ -608,11 +676,25 @@ class _ChatSettingsSectionState extends State<_ChatSettingsSection> {
                 Text('${s.autoMemoryEvery}条'),
               ],
             ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.tune),
+              title: const Text('额外提示词'),
+              subtitle: Text(
+                s.systemPromptExtra.trim().isEmpty
+                    ? '未设置。会追加到每次对话系统提示的末尾（对所有角色生效）'
+                    : s.systemPromptExtra.trim(),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              onTap: () => _editExtraPrompt(context, s),
+            ),
             SwitchListTile(
               dense: true,
-              title: const Text('输出思考内容'),
-              value: s.outputThinking,
-              onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(outputThinking: v)),
+              title: const Text('显示思考过程'),
+              subtitle: const Text('关闭后聊天里不再显示「思考」折叠块，仅看正文'),
+              value: s.showThinking,
+              onChanged: (v) => context.read<AppState>().updateSettings(s.copyWith(showThinking: v)),
             ),
             Row(
               children: [
@@ -635,6 +717,34 @@ class _ChatSettingsSectionState extends State<_ChatSettingsSection> {
       ),
     );
   }
+
+  /// 编辑全局额外提示词（注入到每次对话的系统提示末尾）
+  Future<void> _editExtraPrompt(BuildContext context, AppSettings s) async {
+    final ctrl = TextEditingController(text: s.systemPromptExtra);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (d) => AlertDialog(
+        title: const Text('额外提示词'),
+        content: TextField(
+          controller: ctrl,
+          maxLines: 8,
+          minLines: 4,
+          decoration: const InputDecoration(
+            hintText: '例如：回复尽量口语化，每条不超过两句话。',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('保存')),
+        ],
+      ),
+    );
+    if (ok == true && context.mounted) {
+      await context.read<AppState>().updateSettings(s.copyWith(systemPromptExtra: ctrl.text.trim()));
+    }
+    ctrl.dispose();
+  }
 }
 
 // ---------------- Data ----------------
@@ -654,21 +764,62 @@ class _DataSectionState extends State<_DataSection> {
           ListTile(
             leading: const Icon(Icons.upload_file),
             title: const Text('导出全部数据'),
-            subtitle: const Text('含角色、聊天、记忆、世界书'),
+            subtitle: const Text('含角色、聊天记录、记忆、世界书、头像与聊天背景；接口配置可选'),
             onTap: _busy ? null : () async {
+              var withProviders = false;
+              final go = await showDialog<bool>(
+                context: context,
+                builder: (d) => StatefulBuilder(
+                  builder: (d, setDlgState) => AlertDialog(
+                    title: const Text('导出全部数据'),
+                    content: SizedBox(
+                      width: double.maxFinite,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('包含：角色、聊天记录、长期记忆、世界书、'
+                              '头像与聊天背景图片（内嵌在文件里）。'),
+                          const SizedBox(height: 4),
+                          CheckboxListTile(
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            value: withProviders,
+                            onChanged: (v) => setDlgState(() => withProviders = v ?? false),
+                            title: const Text('同时导出接口配置'),
+                            subtitle: const Text('接口配置里的 API Key 是明文。'
+                                '只在自己换机迁移时勾选，备份要发给别人时请保持不勾。'),
+                          ),
+                        ],
+                      ),
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(d, false), child: const Text('取消')),
+                      TextButton(onPressed: () => Navigator.pop(d, true), child: const Text('导出')),
+                    ],
+                  ),
+                ),
+              );
+              if (go != true || !context.mounted) return;
               setState(() => _busy = true);
-              final ok = await context.read<AppState>().exportToFile('mostaron_backup.json');
+              final ok = await context
+                  .read<AppState>()
+                  .exportToFile('mostaron_backup.json', includeProviders: withProviders);
               setState(() => _busy = false);
               if (context.mounted) {
-                ScaffoldMessenger.of(context)
-                    .showSnackBar(SnackBar(content: Text(ok ? '导出成功' : '导出失败')));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text(ok
+                        ? (withProviders ? '导出成功（含接口配置）' : '导出成功（不含接口配置）')
+                        : '导出失败')));
               }
             },
           ),
           ListTile(
             leading: const Icon(Icons.download),
             title: const Text('导入全部数据'),
-            subtitle: const Text('从 JSON 备份恢复（覆盖当前数据）'),
+            subtitle: const Text('从 JSON 备份恢复（与现有数据合并，同 ID 跳过、不覆盖；'
+                '备份里没有接口配置时接口需自己重新配置）'),
             onTap: _busy ? null : () async {
               setState(() => _busy = true);
               final ok = await context.read<AppState>().importFromFile();

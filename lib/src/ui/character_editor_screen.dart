@@ -11,7 +11,7 @@ import 'widgets/tag_editors.dart';
 import 'worldbook_screen.dart';
 import 'worldbook_picker.dart';
 import 'avatar_crop_screen.dart';
-import '../utils/file_utils.dart';
+import '../utils/file_adopt.dart';
 
 class CharacterEditorScreen extends StatefulWidget {
   final Character? character;
@@ -200,10 +200,13 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
   }
 
   Future<void> _pickAvatar() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.image);
+    // compressionQuality: 0 关闭插件压缩，避免往公共 Pictures 目录写副本（会进相册）
+    final r = await FilePicker.platform.pickFiles(type: FileType.image, compressionQuality: 0);
     if (r != null && r.files.isNotEmpty) {
-      final path = r.files.first.path ?? '';
+      var path = r.files.first.path ?? '';
       if (path.isEmpty) return;
+      path = await adoptPickedFile(path);
+      if (!mounted) return;
       final cropped = await Navigator.push<String>(
         context,
         MaterialPageRoute(builder: (_) => AvatarCropScreen(imagePath: path)),
@@ -254,6 +257,10 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
       userGender: _ugender.text.trim(),
       userRelation: _urelation.text.trim(),
       userBackground: _ubg.text.trim(),
+      // 编辑时不能丢这两项：否则置顶角色一编辑就沉底，
+      // 导入卡里的 extensions（含导出时写入的聊天记录）会被写成 {}
+      pinned: widget.character?.pinned ?? false,
+      extensions: widget.character?.extensions ?? const {},
       createdAt: widget.character?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
     );
     if (widget.character == null) {
@@ -339,9 +346,14 @@ class _CharacterEditorScreenState extends State<CharacterEditorScreen> {
                     )
                   : null,
               onTap: () async {
-                final r = await FilePicker.platform.pickFiles(type: FileType.image);
+                // compressionQuality: 0 关闭插件压缩，避免往公共 Pictures 目录写副本（会进相册）
+    final r = await FilePicker.platform.pickFiles(type: FileType.image, compressionQuality: 0);
                 if (r != null && r.files.isNotEmpty) {
-                  setState(() => _chatBg.text = r.files.first.path ?? '');
+                  var path = r.files.first.path ?? '';
+                  if (path.isEmpty) return;
+                  path = await adoptPickedFile(path);
+                  if (!mounted) return;
+                  setState(() => _chatBg.text = path);
                 }
               },
             ),

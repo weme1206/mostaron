@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show ZLibDecoder;
 import 'dart:typed_data';
 import '../models/models.dart';
 
@@ -56,7 +57,7 @@ class CharacterCardService {
       if (dataEnd + 4 > bytes.length) break;
       if (type == 'tEXt' || type == 'iTXt' || type == 'zTXt') {
         final chunk = bytes.sublist(dataStart, dataEnd);
-        final found = _extractKeyword(chunk);
+        final found = _extractText(chunk, type);
         if (found != null) {
           return found;
         }
@@ -66,7 +67,12 @@ class CharacterCardService {
     return null;
   }
 
-  static Uint8List? _extractKeyword(Uint8List chunk) {
+  /// 按 chunk 类型正确解析：
+  /// - tEXt: keyword\0 text(latin1/utf8)
+  /// - zTXt: keyword\0 method(1) zlib(text)
+  /// - iTXt: keyword\0 compressedFlag(1) method(1) languageTag\0 translatedKeyword\0 text
+  /// 之前把"关键字之后的全部字节"直接当 base64，iTXt/zTXt 会解析失败。
+  static Uint8List? _extractText(Uint8List chunk, String type) {
     // 关键字以 \0 结尾
     int nullIdx = -1;
     for (int i = 0; i < chunk.length; i++) {
@@ -78,13 +84,34 @@ class CharacterCardService {
     if (nullIdx <= 0) return null;
     final keyword = ascii.decode(chunk.sublist(0, nullIdx), allowInvalid: true);
     if (keyword != 'chara' && keyword != 'ccv3') return null;
-    // 值从 nullIdx+1 开始（tEXt），zTXt 可能压缩；这里按最普遍的无压缩 tEXt 处理
     try {
-      final b64 = utf8.decode(chunk.sublist(nullIdx + 1), allowMalformed: true).trim();
-      if (b64.isEmpty) return null;
+      String text;
+      if (type == 'tEXt') {
+        text = utf8.decode(chunk.sublist(nullIdx + 1), allowMalformed: true);
+      } else if (type == 'zTXt') {
+        final p = nullIdx + 1;
+        if (p >= chunk.length) return null;
+        final raw = ZLibDecoder().convert(chunk.sublist(p + 1));
+        text = utf8.decode(raw, allowMalformed: true);
+      } else {
+        var p = nullIdx + 1;
+        if (p + 2 > chunk.length) return null;
+        final compressed = chunk[p] == 1;
+        p += 2; // 跳过 compressionFlag + compressionMethod
+        final langEnd = chunk.indexOf(0, p);
+        if (langEnd < 0) return null;
+        final transEnd = chunk.indexOf(0, langEnd + 1);
+        if (transEnd < 0) return null;
+        p = transEnd + 1;
+        final data = chunk.sublist(p);
+        final raw = compressed ? ZLibDecoder().convert(data) : data;
+        text = utf8.decode(raw, allowMalformed: true);
+      }
+      final value = text.trim();
+      if (value.isEmpty) return null;
       // 可能是直接 JSON（某些卡没 base64）
-      if (b64.startsWith('{')) return utf8.encode(b64);
-      return base64Decode(b64);
+      if (value.startsWith('{')) return utf8.encode(value);
+      return base64Decode(value);
     } catch (_) {
       return null;
     }
@@ -101,7 +128,7 @@ class CharacterCardService {
       // EXIF 块里含 tEXt 结构
       if (tag == 'EXIF') {
         final exif = bytes.sublist(dataStart, dataEnd);
-        final found = _extractKeyword(exif);
+        final found = _extractText(exif, 'tEXt');
         if (found != null) return found;
       }
       offset = dataEnd + (size % 2); // word-aligned
@@ -178,7 +205,29 @@ class CharacterCardService {
   }
 
   /// 把角色（含扩展字段、世界书）导出为 V2 JSON 字符串。
-  static String toV2Json(Character c, {List<WorldbookEntry> worldbook = const []}) {
+  /// [chatMessages] 非空时，把聊天记录写入 extensions.mostaron.chat
+  /// （规范要求保留未知扩展字段，其他前端会原样忽略，不会破坏卡片）。
+  static String toV2Json(
+    Character c, {
+    List<WorldbookEntry> worldbook = const [],
+    List<ChatMessage> chatMessages = const [],
+  }) {
+    final ext = <String, dynamic>{...c.extensions};
+    if (chatMessages.isNotEmpty) {
+      final existing = ext['mostaron'];
+      final base = existing is Map ? Map<String, dynamic>.from(existing) : <String, dynamic>{};
+      base['chat'] = chatMessages
+          .map((m) => {
+                'role': m.role,
+                'content': m.content,
+                'reasoning': m.reasoning,
+                'created_at': m.createdAt,
+                if (m.attachments.isNotEmpty)
+                  'meta': m.attachments.map((a) => a.toMap()).toList(),
+              })
+          .toList();
+      ext['mostaron'] = base;
+    }
     final data = <String, dynamic>{
       'name': c.name,
       'description': c.persona,
@@ -193,7 +242,7 @@ class CharacterCardService {
       'tags': c.tags,
       'creator': c.creator,
       'character_version': c.characterVersion,
-      'extensions': c.extensions.isEmpty ? <String, dynamic>{} : c.extensions,
+      'extensions': ext,
     };
     if (worldbook.isNotEmpty) {
       data['character_book'] = {

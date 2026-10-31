@@ -30,10 +30,12 @@ class UsageHelpScreen extends StatelessWidget {
             '输入框左上角 AI 改写按钮：改写输入中的消息（改写时清空输入并显示"正在改写…"，可撤销 / 取消）。',
             '输入框左下角 ＋ 按钮：小面板可选 **切换模型 / 添加图片 / 选择文件**。',
             '上传的图片或文件会显示在**输入框上方**，不立即发送；与你输入的文字**合并成一条消息**一起发送，可逐个删除。',
+            '**图片会直接显示在气泡里**（按原图宽高比缩放），点开可全屏查看、双指缩放、**右上角按钮保存到相册**；文件显示为文件名卡片。',
+            '聊天列表按**条数**定位：查找跳转、翻历史都不会再"差一点"或"突然跳到底"。上滑自动加载更早，下滑自动加载更晚。',
             '打字机输出时，消息左上角显示"思考中"；输出完成后可点"思考"展开查看。',
             '输入框：回车换行，点发送键发送。',
             '顶部菜单：角色设置、聊天窗口设置、查找聊天记录、长期记忆、选择世界书、删除对话。',
-            '查找聊天记录：点结果会**跳到对应消息并高亮**，返回键可回到查找结果页。',
+            '查找聊天记录：点结果会**滑动到对应消息并居中高亮**，返回键可回到查找结果页。',
           ]),
           _Mod('4. 群聊', [
             '点"创建群聊"先选**记忆模式**（整体/独立/同步），再进入创建页；建好后不可改。',
@@ -47,7 +49,10 @@ class UsageHelpScreen extends StatelessWidget {
             '开启"记忆注入"后，置顶规则 + 最近记忆都会进入系统提示。',
             '"AI 生成记忆"会让 AI 从对话**提炼一份记忆条目**（不是续写对话）。',
             '开启记忆后，角色每回复满设定条数（默认 6）会**自动生成**一次长记忆；群聊三种记忆模式都支持。',
-            '感应现实：让角色知道当前日期时间；记忆达上限自动清理（可设上限）。',
+            '感应现实：让角色知道当前日期时间。',
+            '**记忆达上限自动压缩**：达到上限时，取最老的「压缩数量比」那部分，按「压缩比例」合并成更少的条目（默认上限 100、压缩数量比 20%、压缩比例 50%：100 条 → 压缩最老 20 条 → 合并成 10 条，总数变 90）。压缩比例 100% 时直接删除这批旧记忆。**置顶记忆永不参与压缩**。',
+            '三个参数都在 设置 → 记忆 里调整：上限 10–999、压缩数量比 10%–100%、压缩比例 10%–100%。',
+            '压缩需要调用你的模型接口；未配置接口时会退化为直接删除这批旧记忆。',
           ]),
           _Mod('6. 世界书', [
             '世界书全局管理："设置 → 世界书"里新增/编辑/删除。',
@@ -61,7 +66,8 @@ class UsageHelpScreen extends StatelessWidget {
           ]),
           _Mod('8. 数据', [
             '一键导出/导入全部数据（含角色、聊天、记忆、世界书、接口配置）。',
-            '导出会**内嵌角色头像 / 聊天背景图片**，换机导入后头像不丢失；旧版本备份也能正常导入。',
+            '导出会**内嵌角色头像 / 聊天背景 / 聊天里的图片**，换机导入后图片不丢失；旧版本备份也能正常导入。',
+            '导出角色卡时可选择**是否包含聊天记录**（写在卡片扩展字段里，其他前端会忽略）；导入带聊天记录的卡会自动恢复对话。',
             '导入为合并模式：不会覆盖已存在的数据。',
             '全部数据本地存储（SQLite），不上传任何内容。',
           ]),
@@ -79,8 +85,26 @@ class _Mod extends StatelessWidget {
   final String title;
   final List<String> body;
   const _Mod(this.title, this.body);
+
+  /// 极简 Markdown：只处理 **加粗**，其余原样。
+  static List<TextSpan> _spans(String text, TextStyle base) {
+    final out = <TextSpan>[];
+    final parts = text.split('**');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].isEmpty) continue;
+      out.add(TextSpan(
+        text: parts[i],
+        style: i.isOdd
+            ? base.copyWith(fontWeight: FontWeight.bold)
+            : base,
+      ));
+    }
+    return out;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final base = TextStyle(height: 1.5, color: Theme.of(context).colorScheme.onSurface);
     return Padding(
       padding: const EdgeInsets.only(bottom: 16),
       child: Column(
@@ -91,7 +115,10 @@ class _Mod extends StatelessWidget {
           for (final line in body)
             Padding(
               padding: const EdgeInsets.only(bottom: 4),
-              child: Text('• $line', style: const TextStyle(height: 1.5)),
+              child: Text.rich(TextSpan(children: [
+                TextSpan(text: '• ', style: base),
+                ..._spans(line, base),
+              ])),
             ),
         ],
       ),

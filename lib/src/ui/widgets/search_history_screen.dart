@@ -21,7 +21,7 @@ class SearchHistoryScreen extends StatefulWidget {
 
 class _SearchHistoryScreenState extends State<SearchHistoryScreen> {
   final TextEditingController _ctrl = TextEditingController();
-  List<ChatMessage> _all = [];
+  String? _sessionId;
   List<ChatMessage> _results = [];
   Character? _char;
   ChatGroup? _group;
@@ -44,11 +44,11 @@ class _SearchHistoryScreenState extends State<SearchHistoryScreen> {
     final state = context.read<AppState>();
     if (widget.characterId != null) {
       _char = await state.getCharacter(widget.characterId!);
+      // 只取会话 id，消息不整段读进内存（长会话会很吃内存）
       final session = await state.getOrCreateSession(widget.characterId!);
-      _all = await state.messagesFor(session.id);
+      _sessionId = session.id;
     } else if (widget.groupId != null) {
       _group = await state.getGroup(widget.groupId!);
-      _all = await state.groupMessages(widget.groupId!);
       if (_group != null) {
         for (final mid in _group!.memberIds) {
           final c = await state.getCharacter(mid);
@@ -59,21 +59,58 @@ class _SearchHistoryScreenState extends State<SearchHistoryScreen> {
     if (mounted) setState(() => _loading = false);
   }
 
-  void _search(String q) {
-    setState(() => _results = SearchUtil.search(_all, q));
+  Future<void> _search(String q) async {
+    final words = q
+        .trim()
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (words.isEmpty) {
+      setState(() => _results = []);
+      return;
+    }
+    final state = context.read<AppState>();
+    final list = await state.searchMessages(
+      sessionId: _sessionId,
+      groupId: widget.groupId,
+      words: words,
+    );
+    if (mounted) setState(() => _results = list);
   }
 
   /// 打开聊天页并定位到该消息；查找页保留在栈中，返回键会回到查找结果页。
-  void _openMessage(BuildContext context, ChatMessage m) {
+  /// 传入消息在会话中的全局索引，聊天页只加载目标上下各 10 条。
+  Future<void> _openMessage(BuildContext context, ChatMessage m) async {
+    final state = context.read<AppState>();
+    int? idx;
+    if (_sessionId != null) {
+      idx = await state.indexOfMessageForSession(_sessionId!, m.id);
+    } else if (widget.groupId != null) {
+      idx = await state.indexOfMessageForGroup(widget.groupId!, m.id);
+    }
+    if (!context.mounted) return;
     if (widget.characterId != null) {
       Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => ChatScreen(characterId: widget.characterId!, initialSearchTargetId: m.id)),
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            characterId: widget.characterId!,
+            initialSearchTargetId: m.id,
+            initialSearchTargetIndex: idx,
+          ),
+        ),
       );
     } else if (widget.groupId != null) {
       Navigator.push(
         context,
-        MaterialPageRoute(builder: (_) => GroupChatScreen(groupId: widget.groupId!, initialSearchTargetId: m.id)),
+        MaterialPageRoute(
+          builder: (_) => GroupChatScreen(
+            groupId: widget.groupId!,
+            initialSearchTargetId: m.id,
+            initialSearchTargetIndex: idx,
+          ),
+        ),
       );
     }
   }

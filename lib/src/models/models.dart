@@ -294,6 +294,62 @@ Map<String, dynamic> _decodeMap(dynamic v) {
   return {};
 }
 
+// ---------------- Attachment ----------------
+/// 消息附件：图片（带宽高，便于预留占位避免布局漂移）或普通文件。
+class Attachment {
+  final String type; // image / file
+  final String path;
+  final int width;
+  final int height;
+  final String name;
+
+  const Attachment({
+    required this.type,
+    required this.path,
+    this.width = 0,
+    this.height = 0,
+    this.name = '',
+  });
+
+  bool get isImage => type == 'image';
+
+  Map<String, dynamic> toMap() => {
+        'type': type,
+        'path': path,
+        if (width > 0) 'w': width,
+        if (height > 0) 'h': height,
+        if (name.isNotEmpty) 'name': name,
+      };
+
+  factory Attachment.fromMap(Map<String, dynamic> m) => Attachment(
+        type: m['type'] as String? ?? 'file',
+        path: m['path'] as String? ?? '',
+        width: (m['w'] as num?)?.toInt() ?? 0,
+        height: (m['h'] as num?)?.toInt() ?? 0,
+        name: m['name'] as String? ?? '',
+      );
+}
+
+List<Attachment> decodeAttachments(dynamic v) {
+  dynamic raw = v;
+  if (raw is String) {
+    if (raw.trim().isEmpty) return const [];
+    try {
+      raw = jsonDecode(raw);
+    } catch (_) {
+      return const [];
+    }
+  }
+  if (raw is List) {
+    final out = <Attachment>[];
+    for (final e in raw) {
+      if (e is Map) out.add(Attachment.fromMap(Map<String, dynamic>.from(e)));
+    }
+    return out;
+  }
+  return const [];
+}
+
 // ---------------- Chat ----------------
 class ChatSession {
   final String id;
@@ -336,6 +392,7 @@ class ChatMessage {
   final String reasoning;
   final String? senderCharacterId;
   final int createdAt;
+  final List<Attachment> attachments;
 
   ChatMessage({
     required this.id,
@@ -346,6 +403,7 @@ class ChatMessage {
     this.reasoning = '',
     this.senderCharacterId,
     required this.createdAt,
+    this.attachments = const [],
   });
 
   Map<String, dynamic> toMap() => {
@@ -357,6 +415,9 @@ class ChatMessage {
         'reasoning': reasoning,
         'sender_id': senderCharacterId,
         'created_at': createdAt,
+        'meta': attachments.isEmpty
+            ? null
+            : jsonEncode(attachments.map((a) => a.toMap()).toList()),
       };
 
   factory ChatMessage.fromMap(Map<String, dynamic> m) => ChatMessage(
@@ -368,16 +429,19 @@ class ChatMessage {
         reasoning: m['reasoning'] as String? ?? '',
         senderCharacterId: m['sender_id'] as String?,
         createdAt: m['created_at'] as int? ?? 0,
+        attachments: decodeAttachments(m['meta']),
       );
 
-  ChatMessage copyWith({String? content}) => ChatMessage(
+  ChatMessage copyWith({String? content, String? reasoning, List<Attachment>? attachments}) => ChatMessage(
         id: id,
         sessionId: sessionId,
         groupId: groupId,
         role: role,
         content: content ?? this.content,
+        reasoning: reasoning ?? this.reasoning,
         senderCharacterId: senderCharacterId,
         createdAt: createdAt,
+        attachments: attachments ?? this.attachments,
       );
 }
 
@@ -531,6 +595,10 @@ class MemoryItem {
   final String content;
   bool pinned;
   final int createdAt;
+  /// normal=普通记忆；summary=压缩后的摘要记忆
+  final String kind;
+  /// 摘要记忆的来源记忆 id（用于追溯/避免重复压缩）
+  final List<String> summaryOf;
 
   MemoryItem({
     required this.id,
@@ -538,7 +606,11 @@ class MemoryItem {
     required this.content,
     this.pinned = false,
     this.createdAt = 0,
+    this.kind = 'normal',
+    this.summaryOf = const [],
   });
+
+  bool get isSummary => kind == 'summary';
 
   Map<String, dynamic> toMap() => {
         'id': id,
@@ -546,6 +618,8 @@ class MemoryItem {
         'content': content,
         'pinned': pinned ? 1 : 0,
         'created_at': createdAt,
+        'kind': kind,
+        'summary_of': summaryOf.isEmpty ? null : jsonEncode(summaryOf),
       };
 
   factory MemoryItem.fromMap(Map<String, dynamic> m) => MemoryItem(
@@ -554,14 +628,18 @@ class MemoryItem {
         content: m['content'] as String? ?? '',
         pinned: (m['pinned'] as int? ?? 0) == 1,
         createdAt: m['created_at'] as int? ?? 0,
+        kind: m['kind'] as String? ?? 'normal',
+        summaryOf: _decodeList(m['summary_of']),
       );
 
-  MemoryItem copyWith({String? content, bool? pinned}) => MemoryItem(
+  MemoryItem copyWith({String? content, bool? pinned, String? kind, List<String>? summaryOf}) => MemoryItem(
         id: id,
         characterId: characterId,
         content: content ?? this.content,
         pinned: pinned ?? this.pinned,
         createdAt: createdAt,
+        kind: kind ?? this.kind,
+        summaryOf: summaryOf ?? this.summaryOf,
       );
 }
 
@@ -642,8 +720,13 @@ class AppSettings {
   bool memoryAutoPrune;
   int memoryLimit;
   int autoMemoryEvery; // 每多少条对话自动生成一次记忆
+  /// 压缩数量比：记忆达到上限时，压缩最老记忆的比例（0.1~1.0）
+  double memoryCompressCountRatio;
+  /// 压缩比例：被压缩的那批记忆保留多少成文本（0.1~1.0，1.0 表示全部删除）
+  double memoryCompressKeepRatio;
 
-  bool outputThinking;
+  /// 是否在消息里显示思考过程（默认显示）
+  bool showThinking;
 
   String themeAccent;
   String chatBackground;
@@ -670,9 +753,11 @@ class AppSettings {
     this.showUserAvatar = true,
     this.realSense = true,
     this.memoryAutoPrune = true,
-    this.memoryLimit = 500,
+    this.memoryLimit = 100,
     this.autoMemoryEvery = 6,
-    this.outputThinking = false,
+    this.memoryCompressCountRatio = 0.2,
+    this.memoryCompressKeepRatio = 0.5,
+    this.showThinking = true,
     this.themeAccent = 'blue',
     this.chatBackground = '',
     this.nightAutoDark = false,
@@ -701,7 +786,9 @@ class AppSettings {
         'memory_auto_prune': memoryAutoPrune ? 1 : 0,
         'memory_limit': memoryLimit,
         'auto_memory_every': autoMemoryEvery,
-        'output_thinking': outputThinking ? 1 : 0,
+        'memory_compress_count_ratio': memoryCompressCountRatio,
+        'memory_compress_keep_ratio': memoryCompressKeepRatio,
+        'show_thinking': showThinking ? 1 : 0,
         'theme_accent': themeAccent,
         'chat_background': chatBackground,
         'night_auto_dark': nightAutoDark ? 1 : 0,
@@ -728,9 +815,15 @@ class AppSettings {
         showUserAvatar: (m['show_user_avatar'] as int? ?? 1) == 1,
         realSense: (m['real_sense'] as int? ?? 1) == 1,
         memoryAutoPrune: (m['memory_auto_prune'] as int? ?? 1) == 1,
-        memoryLimit: m['memory_limit'] as int? ?? 500,
+        memoryLimit: m['memory_limit'] as int? ?? 100,
         autoMemoryEvery: m['auto_memory_every'] as int? ?? 6,
-        outputThinking: (m['output_thinking'] as int? ?? 0) == 1,
+        memoryCompressCountRatio:
+            (m['memory_compress_count_ratio'] as num? ?? 0.2).toDouble(),
+        memoryCompressKeepRatio:
+            (m['memory_compress_keep_ratio'] as num? ?? 0.5).toDouble(),
+        // 旧字段 output_thinking 是无效开关（以前只存不用），不再读取；
+        // 新字段默认开启，保证"发图后看不到思考"这类问题不会因迁移再犯。
+        showThinking: (m['show_thinking'] as int? ?? 1) == 1,
         themeAccent: m['theme_accent'] as String? ?? 'blue',
         chatBackground: m['chat_background'] as String? ?? '',
         nightAutoDark: (m['night_auto_dark'] as int? ?? 0) == 1,
@@ -759,7 +852,9 @@ class AppSettings {
     bool? memoryAutoPrune,
     int? memoryLimit,
     int? autoMemoryEvery,
-    bool? outputThinking,
+    double? memoryCompressCountRatio,
+    double? memoryCompressKeepRatio,
+    bool? showThinking,
     String? themeAccent,
     String? chatBackground,
     bool? nightAutoDark,
@@ -787,7 +882,11 @@ class AppSettings {
         memoryAutoPrune: memoryAutoPrune ?? this.memoryAutoPrune,
         memoryLimit: memoryLimit ?? this.memoryLimit,
         autoMemoryEvery: autoMemoryEvery ?? this.autoMemoryEvery,
-        outputThinking: outputThinking ?? this.outputThinking,
+        memoryCompressCountRatio:
+            memoryCompressCountRatio ?? this.memoryCompressCountRatio,
+        memoryCompressKeepRatio:
+            memoryCompressKeepRatio ?? this.memoryCompressKeepRatio,
+        showThinking: showThinking ?? this.showThinking,
         themeAccent: themeAccent ?? this.themeAccent,
         chatBackground: chatBackground ?? this.chatBackground,
         nightAutoDark: nightAutoDark ?? this.nightAutoDark,

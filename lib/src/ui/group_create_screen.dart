@@ -9,7 +9,7 @@ import 'widgets/preset_avatar.dart';
 import 'worldbook_screen.dart';
 import 'worldbook_picker.dart';
 import 'avatar_crop_screen.dart';
-import '../utils/file_utils.dart';
+import '../utils/file_adopt.dart';
 
 class GroupCreateScreen extends StatefulWidget {
   final ChatGroup? group;
@@ -81,7 +81,7 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
   }
 
   Future<void> _pickAvatar() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.image);
+    final r = await FilePicker.platform.pickFiles(type: FileType.image, compressionQuality: 0);
     if (r != null && r.files.isNotEmpty) {
       final path = r.files.first.path ?? '';
       if (path.isEmpty) return;
@@ -92,9 +92,14 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
   }
 
   Future<void> _pickBackground() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.image);
+    final r = await FilePicker.platform.pickFiles(type: FileType.image, compressionQuality: 0);
     if (r != null && r.files.isNotEmpty) {
-      setState(() => _background = r.files.first.path ?? '');
+      var path = r.files.first.path ?? '';
+      if (path.isEmpty) return;
+      // 搬到应用私有目录：file_picker 的缓存会被系统清理，否则背景图会消失
+      path = await adoptPickedFile(path);
+      if (!mounted) return;
+      setState(() => _background = path);
     }
   }
 
@@ -171,6 +176,10 @@ class _GroupCreateScreenState extends State<GroupCreateScreen> {
       lastActivity: widget.group?.lastActivity ?? 0,
       userName: _uname.text.trim(),
       userGender: _ugender.text.trim(),
+      // 编辑时保留：群独立的接口/模型、与玩家的关系
+      userRelation: widget.group?.userRelation ?? '',
+      providerId: widget.group?.providerId,
+      model: widget.group?.model,
       userBackground: _ubg.text.trim(),
       createdAt: widget.group?.createdAt ?? DateTime.now().millisecondsSinceEpoch,
       pinned: widget.group?.pinned ?? false,
