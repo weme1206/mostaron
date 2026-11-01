@@ -57,7 +57,10 @@ class _MemoryScreenState extends State<MemoryScreen> {
     if (widget.historyGroupId != null) {
       history = await state.groupMessages(widget.historyGroupId!);
     } else if (widget.characterId.startsWith('group_')) {
-      history = await state.groupMessages(widget.characterId.substring(6));
+      // separate 模式的键是 group_<gid>_char_<cid>，不能简单截取前 6 位。
+      final match = RegExp(r'^group_(.+)_char_(.+)$').firstMatch(widget.characterId);
+      final groupId = match?.group(1) ?? widget.characterId.substring(6);
+      history = await state.groupMessages(groupId);
     } else {
       final session = await state.getOrCreateSession(widget.characterId);
       history = await state.messagesFor(session.id);

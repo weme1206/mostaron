@@ -252,8 +252,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _listView(BuildContext context, AppState state, List<_HomeItem> items) {
+    // 沉浸式导航栏下，列表需要留出系统手势条高度，避免最后一项被遮挡。
+    final bottomInset = MediaQuery.of(context).viewPadding.bottom;
     return ListView.builder(
-      padding: EdgeInsets.zero,
+      padding: EdgeInsets.only(bottom: bottomInset + 8),
       itemCount: items.length,
       itemBuilder: (context, i) {
         final it = items[i];
@@ -271,7 +273,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final bg = state.settings.chatBackground;
     final hasBg = bg.isNotEmpty && File(bg).existsSync();
     return GridView.builder(
-      padding: const EdgeInsets.all(12),
+      padding: EdgeInsets.fromLTRB(12, 12, 12, MediaQuery.of(context).viewPadding.bottom + 12),
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2, childAspectRatio: 0.86, crossAxisSpacing: 12, mainAxisSpacing: 12),
       itemCount: items.length,

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'src/state/app_state.dart';
 import 'src/ui/theme.dart';
@@ -6,6 +7,13 @@ import 'src/ui/home_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // 沉浸式系统栏：导航栏背景与分隔线完全透明，页面内容延伸到屏幕底部。
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    systemNavigationBarColor: Colors.transparent,
+    systemNavigationBarDividerColor: Colors.transparent,
+  ));
   runApp(const MostaronApp());
 }
 

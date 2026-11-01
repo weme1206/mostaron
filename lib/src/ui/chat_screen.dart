@@ -71,6 +71,8 @@ class _ChatScreenState extends State<ChatScreen> {
   bool? _hideCharAvatar;
   bool? _hideUserAvatar;
   int _searchReturnIndex = -1; // 本地索引
+  /// 查找定位是否已完成（完成前列表透明，避免看到"先贴边再居中"的那一帧）
+  bool _positioned = false;
   bool _inputRewriting = false;
   final List<PendingAttachment> _attachments = [];
 
@@ -217,6 +219,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // 否则会差一条、跳到相邻的另一条搜索结果
       _searchReturnIndex =
           targetIdx == null || msgs.isEmpty ? -1 : (start + msgs.length - 1 - targetIdx);
+      // 非查找进入直接可见；查找进入先隐藏，等定位完成再显示
+      _positioned = targetIdx == null;
       _loading = false;
     });
     if (targetIdx != null) {
@@ -1239,26 +1243,45 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  /// 查找聊天记录后滚到某条消息（本地索引）并高亮：滑动到居中。
+  /// 消息本地索引 → SPL 原始索引（唯一换算来源，build 与定位共用同一套规则）。
+  /// 私聊列表是正序 + 统一按"距底部位置"排列：rawIndex 0 = 最老那条。
+  int? _rawOfMessage(int msgIndex) {
+    if (msgIndex < 0 || msgIndex >= _messages.length) return null;
+    final streamOffset = _streaming ? 1 : 0;
+    final itemCount = _messages.length + streamOffset + (_searchReturnIndex >= 0 ? 1 : 0);
+    final fromBottom = msgIndex + streamOffset; // 距底部的位置：0 = 最新
+    return itemCount - 1 - fromBottom;
+  }
+
+  /// 查找聊天记录后定位到某条消息，并让它**置顶**（对齐视口顶部）。
+  ///
+  /// 置顶 = 目标条目的起始边落在视口顶部，这是 SPL `jumpTo` 原生能力，
+  /// 不需要知道条目高度，因此**一次跳、精确、绝不出屏幕**。
+  /// 正序列表（reverse:false）下 alignment: 0 就是把目标顶到最上方。
   void _scrollToIndex(int idx) {
-    if (idx < 0 || idx >= _messages.length) return;
-    final raw = _rawCount - 1 - idx;
+    var msgIndex = idx;
+    final targetId = widget.initialSearchTargetId;
+    if (targetId != null) {
+      final found = _messages.indexWhere((m) => m.id == targetId);
+      if (found >= 0) msgIndex = found;
+    }
+    final raw = _rawOfMessage(msgIndex);
+    if (raw == null) {
+      // 找不到目标（消息已删等）：别让列表一直透明
+      if (!_positioned && mounted) setState(() => _positioned = true);
+      return;
+    }
+    if (!_positioned) setState(() => _positioned = false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       try {
-        _itemScroll.jumpTo(index: raw, alignment: 0.5);
+        _itemScroll.jumpTo(index: raw, alignment: 0);
       } catch (_) {}
-      Future.delayed(const Duration(milliseconds: 16), () {
-        if (!mounted) return;
-        try {
-          _itemScroll.scrollTo(
-            index: raw,
-            alignment: 0.5,
-            duration: const Duration(milliseconds: 250),
-            curve: Curves.easeOut,
-          );
-        } catch (_) {}
-      });
+      if (!_positioned) setState(() => _positioned = true);
+    });
+    // 兜底：极端情况下测量/挂载失败也要把列表显示出来，不能一直透明
+    Future.delayed(const Duration(milliseconds: 900), () {
+      if (mounted && !_positioned) setState(() => _positioned = true);
     });
   }
 
@@ -1537,21 +1560,29 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    return ScrollablePositionedList.builder(
-      itemScrollController: _itemScroll,
-      itemPositionsListener: _itemPositions,
-      reverse: false,
-      padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
-      itemCount: itemCount,
-      itemBuilder: (context, rawIndex) {
-        // 统一换算成"距底部的位置"：0 = 最新
-        final i = itemCount - 1 - rawIndex;
-        if (streamOffset == 1 && i == 0) return streamItem();
-        final k = i - streamOffset; // 本地索引：0 = 最新
-        if (showBanner && k == msgCount) return _searchReturnBanner();
-        if (k < 0 || k >= msgCount) return const SizedBox.shrink();
-        return msgItem(k);
-      },
+    // 查找定位：定位完成前整张列表透明（仍参与布局，所以能量高度），
+    // 避免"先贴到起始边、下一帧才居中"的中间态被看到。
+    final searchRaw = _searchReturnIndex >= 0 ? _rawOfMessage(_searchReturnIndex) : null;
+    return Opacity(
+      opacity: _positioned ? 1 : 0,
+      child: ScrollablePositionedList.builder(
+        itemScrollController: _itemScroll,
+        itemPositionsListener: _itemPositions,
+        initialScrollIndex: searchRaw ?? 0,
+        initialAlignment: 0.0,
+        reverse: false,
+        padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
+        itemCount: itemCount,
+        itemBuilder: (context, rawIndex) {
+          // 统一换算成"距底部的位置"：0 = 最新
+          final i = itemCount - 1 - rawIndex;
+          if (streamOffset == 1 && i == 0) return streamItem();
+          final k = i - streamOffset; // 本地索引：0 = 最新
+          if (showBanner && k == msgCount) return _searchReturnBanner();
+          if (k < 0 || k >= msgCount) return const SizedBox.shrink();
+          return msgItem(k);
+        },
+      ),
     );
   }
 
@@ -1789,9 +1820,8 @@ class _ModelSwitchSheetState extends State<_ModelSwitchSheet> {
                 _selectedProviderId = v;
                 _selectedProvider = p;
                 _models = p.models;
-                _modelCtrl.text = widget.character.model?.isNotEmpty == true
-                    ? widget.character.model!
-                    : p.model;
+                // 模型名通常与接口绑定，换接口时必须换用新接口的默认模型。
+                _modelCtrl.text = p.model;
               }),
             ),
           const SizedBox(height: 8),

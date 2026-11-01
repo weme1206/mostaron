@@ -60,6 +60,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   bool _loading = true;
   int _turn = 0; // 用于轮流回复起始位置
   int _searchReturnIndex = -1;
+  /// 查找定位是否已完成（完成前列表透明，避免看到"先贴边再居中"的那一帧）
+  bool _positioned = false;
   bool _inputRewriting = false;
   final List<PendingAttachment> _attachments = [];
 
@@ -113,17 +115,21 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (!_anchored || _pagingSuppressed || _loading) return;
     final positions = _itemPositions.itemPositions.value;
     if (positions.isEmpty) return;
-    var minIdx = positions.first.index;
-    var maxIdx = positions.first.index;
-    for (final p in positions) {
-      if (p.index < minIdx) minIdx = p.index;
-      if (p.index > maxIdx) maxIdx = p.index;
-    }
+    final itemCount = _messages.length + (_streaming ? 1 : 0) + (_searchReturnIndex >= 0 ? 1 : 0);
     final streamOffset = _streaming ? 1 : 0;
-    final msgMax = maxIdx - streamOffset;
-    final msgMin = minIdx - streamOffset;
-    if (msgMax >= _messages.length - 5 && _hasOlder) _loadOlder();
-    if (msgMin <= 1 && _hasNewer) _loadNewer();
+    var minK = 1 << 30;
+    var maxK = -1;
+    for (final p in positions) {
+      // 定位列表是正序：p.index 0 = 最老，需反推回"距底部位置"再算本地索引
+      final i = itemCount - 1 - p.index; // 距底部位置：0 = 最新
+      final k = i - streamOffset;
+      if (k < minK) minK = k;
+      if (k > maxK) maxK = k;
+    }
+    // 靠近更老方向（本地索引变大）
+    if (maxK >= _messages.length - 5 && _hasOlder) _loadOlder();
+    // 靠近最新方向（本地索引变小）
+    if (minK <= 1 && _hasNewer) _loadNewer();
   }
 
   @override
@@ -178,6 +184,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _windowStart = start;
       _searchReturnIndex =
           targetIdx == null || msgs.isEmpty ? -1 : (start + msgs.length - 1 - targetIdx);
+      // 非查找进入直接可见；查找进入先隐藏，等定位完成再显示
+      _positioned = targetIdx == null;
       _loading = false;
     });
     if (targetIdx != null) {
@@ -199,15 +207,41 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _loadingOlder = false;
       return;
     }
+    // 定位态是正序 SPL：往顶部追加更老消息会让已有条目整体下移，需要还原锚点；
+    // 普通态是反序 ListView，顶部扩展会自动保持视觉位置，无需处理。
+    int anchorRaw = -1;
+    double anchorFrac = 0.0;
+    if (_anchored && _itemScroll.isAttached) {
+      final posOld = _itemPositions.itemPositions.value;
+      if (posOld.isNotEmpty) {
+        var topMost = posOld.first;
+        for (final p in posOld) {
+          if (p.index < topMost.index) topMost = p;
+        }
+        anchorRaw = topMost.index;
+        anchorFrac = topMost.itemLeadingEdge;
+      }
+    }
     setState(() {
       _messages = [..._messages, ...older.reversed];
       _windowStart = start;
       if (_searchReturnIndex >= 0) _searchReturnIndex += older.length;
       _loadingOlder = false;
     });
+    if (anchorRaw >= 0) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        try {
+          _itemScroll.jumpTo(
+            index: anchorRaw + older.length,
+            alignment: anchorFrac.clamp(0.0, 0.99),
+          );
+        } catch (_) {}
+      });
+    }
   }
 
-  /// 加载更晚的一页（插入到开头 = 最新方向），保持视口锚点
+  /// 加载更晚的一页（插入到开头 = 最新方向）
   Future<void> _loadNewer() async {
     if (_loadingNewer || !_hasNewer || _group == null) return;
     _loadingNewer = true;
@@ -215,18 +249,6 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     final offset = _windowStart + _messages.length;
     final remain = _total - offset;
     final limit = remain < _pageSize ? remain : _pageSize;
-
-    int anchorIndex = 0;
-    double anchorAlign = 0.0;
-    final positions = _itemPositions.itemPositions.value;
-    if (positions.isNotEmpty) {
-      var first = positions.first;
-      for (final p in positions) {
-        if (p.index < first.index) first = p;
-      }
-      anchorIndex = first.index;
-      anchorAlign = first.itemLeadingEdge;
-    }
 
     final newer = await state.messageSliceForGroup(_group!.id, offset, limit);
     if (!mounted) {
@@ -238,15 +260,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       _loadingNewer = false;
       if (_searchReturnIndex >= 0) _searchReturnIndex += newer.length;
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      try {
-        _itemScroll.jumpTo(
-          index: anchorIndex + newer.length,
-          alignment: anchorAlign.clamp(0.0, 0.99),
-        );
-      } catch (_) {}
-    });
+    // 正序列表里"插入更新的消息"不改变已有条目的列表索引，无需还原锚点
   }
 
   /// 发送前确保处于最新窗口
@@ -273,8 +287,10 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // 正序列表：底部最新 = 最后一个索引
+      final itemCount = _messages.length + (_streaming ? 1 : 0) + (_searchReturnIndex >= 0 ? 1 : 0);
       try {
-        _itemScroll.jumpTo(index: 0);
+        _itemScroll.jumpTo(index: itemCount - 1);
       } catch (_) {}
     });
   }
@@ -433,10 +449,18 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
   /// 每个角色本轮最多连续发几条（群设置里的"每角色最多回复 N 条"）
   int _replyLimitOf(ChatGroup g) => g.maxReplies <= 0 ? 1 : g.maxReplies.clamp(1, 3);
 
+  /// 最新消息在索引 0；回复判定只能依据最近一条用户消息，不能取窗口里最老的消息。
+  String get _latestUserContent {
+    for (final m in _messages) {
+      if (m.role == 'user') return m.content;
+    }
+    return '';
+  }
+
   Future<void> _autoAll(AppState state, ChatGroup g) async {
     final members = _members.values.toList();
     if (members.isEmpty) return;
-    final last = _messages.isNotEmpty ? _messages.last.content : '';
+    final last = _latestUserContent;
     final mentioned = members.where((m) => last.contains(m.name)).toList();
     final rest = members.where((m) => !mentioned.contains(m)).toList();
     final order = [...mentioned, ...rest];
@@ -482,7 +506,7 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       AppState state, ChatGroup g, List<Character> members) async {
     final provider = _providerFor(members.first, state);
     if (provider == null) return <String>{};
-    final last = _messages.isNotEmpty ? _messages.last.content : '';
+    final last = _latestUserContent;
     final names = members.map((m) => m.name).join('、');
     try {
       final r = (await ApiClient().completeChat(
@@ -647,7 +671,8 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (lastUserIdx >= 0) {
       final users = histories.where((m) => m.role == 'user').toList();
       if (users.isNotEmpty && users.last.attachments.isNotEmpty) {
-        final rich = await buildUserContent(users.last, vision: true);
+        final rich = await buildUserContent(users.last, vision: true)
+            .timeout(const Duration(seconds: 25), onTimeout: () => null);
         if (rich != null) payload[lastUserIdx] = {'role': 'user', 'content': rich};
       }
     }
@@ -1204,11 +1229,13 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
     if (!force) {
       final positions = _itemPositions.itemPositions.value;
       if (positions.isNotEmpty) {
-        var minIdx = positions.first.index;
+        final itemCount = _messages.length + (_streaming ? 1 : 0) + (_searchReturnIndex >= 0 ? 1 : 0);
+        var maxIdx = positions.first.index;
         for (final p in positions) {
-          if (p.index < minIdx) minIdx = p.index;
+          if (p.index > maxIdx) maxIdx = p.index;
         }
-        if (minIdx > 2) return;
+        // 正序列表：最新 = 最大 index；已靠近底部就不必再跳
+        if (maxIdx >= itemCount - 3) return;
       }
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1221,39 +1248,63 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
         });
         return;
       }
+      // 正序列表：底部最新 = 最后一个索引
+      final itemCount = _messages.length + (_streaming ? 1 : 0) + (_searchReturnIndex >= 0 ? 1 : 0);
+      final last = itemCount - 1;
       try {
         if (animate) {
           _itemScroll.scrollTo(
-            index: 0,
+            index: last,
             duration: const Duration(milliseconds: 180),
             curve: Curves.easeOut,
           );
         } else {
-          _itemScroll.jumpTo(index: 0);
+          _itemScroll.jumpTo(index: last);
         }
       } catch (_) {}
     });
   }
 
-  /// 查找聊天记录后定位到某条消息（本地索引）：滑动到居中
+  /// 消息本地索引 → SPL 原始索引（唯一换算来源）。
+  /// 与私聊同一套：定位列表用正序（reverse:false），rawIndex 0 = 最老那条。
+  /// 反推公式：rawIndex = itemCount - 1 - (距底部位置)，距底部位置 = msgIndex + streamOffset。
+  int? _rawOfMessage(int msgIndex) {
+    if (msgIndex < 0 || msgIndex >= _messages.length) return null;
+    final streamOffset = _streaming ? 1 : 0;
+    final itemCount = _messages.length + streamOffset + (_searchReturnIndex >= 0 ? 1 : 0);
+    final fromBottom = msgIndex + streamOffset; // 距底部的位置：0 = 最新
+    return itemCount - 1 - fromBottom;
+  }
+
+  /// 查找聊天记录后定位到某条消息，并让它**置顶**（对齐视口顶部）。
+  ///
+  /// 定位列表已改为正序（reverse:false），与私聊完全同构：
+  /// alignment: 0 就是把目标条目顶到屏幕最上方，SPL 原生能力，
+  /// 不需要条目高度，一次跳、精确、绝不出屏幕。
   void _scrollToIndex(int idx) {
-    if (idx < 0 || idx >= _messages.length) return;
+    var msgIndex = idx;
+    final targetId = widget.initialSearchTargetId;
+    if (targetId != null) {
+      final found = _messages.indexWhere((m) => m.id == targetId);
+      if (found >= 0) msgIndex = found;
+    }
+    final raw = _rawOfMessage(msgIndex);
+    if (raw == null) {
+      // 找不到目标（消息已删等）：别让列表一直透明
+      if (!_positioned && mounted) setState(() => _positioned = true);
+      return;
+    }
+    if (!_positioned) setState(() => _positioned = false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       try {
-        _itemScroll.jumpTo(index: idx, alignment: 0.0);
+        _itemScroll.jumpTo(index: raw, alignment: 0);
       } catch (_) {}
-      Future.delayed(const Duration(milliseconds: 16), () {
-        if (!mounted) return;
-        try {
-          _itemScroll.scrollTo(
-            index: idx,
-            alignment: 0.5,
-            duration: const Duration(milliseconds: 250),
-            curve: Curves.easeOut,
-          );
-        } catch (_) {}
-      });
+      if (!_positioned) setState(() => _positioned = true);
+    });
+    // 兜底：极端情况下测量/挂载失败也要把列表显示出来，不能一直透明
+    Future.delayed(const Duration(milliseconds: 900), () {
+      if (mounted && !_positioned) setState(() => _positioned = true);
     });
   }
 
@@ -1546,13 +1597,25 @@ class _GroupChatScreenState extends State<GroupChatScreen> {
       );
     }
 
-    return ScrollablePositionedList.builder(
-      itemScrollController: _itemScroll,
-      itemPositionsListener: _itemPositions,
-      reverse: true,
-      padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
-      itemCount: itemCount,
-      itemBuilder: (context, i) => itemAt(i),
+    // 查找定位：与私聊同一套做法——正序（reverse:false）+ 置顶（alignment:0）。
+    // 定位完成前整张列表透明（仍参与布局），避免首帧"先贴底再跳到顶部"的中间态被看到。
+    final searchRaw = _searchReturnIndex >= 0 ? _rawOfMessage(_searchReturnIndex) : null;
+    return Opacity(
+      opacity: _positioned ? 1 : 0,
+      child: ScrollablePositionedList.builder(
+        itemScrollController: _itemScroll,
+        itemPositionsListener: _itemPositions,
+        initialScrollIndex: searchRaw ?? 0,
+        initialAlignment: 0.0,
+        reverse: false,
+        padding: EdgeInsets.only(top: topInset + 8, bottom: 12),
+        itemCount: itemCount,
+        itemBuilder: (context, rawIndex) {
+          // 统一换算成"距底部的位置"：0 = 最新（与私聊完全一致）
+          final i = itemCount - 1 - rawIndex;
+          return itemAt(i);
+        },
+      ),
     );
   }
 
@@ -1894,7 +1957,8 @@ class _GroupModelSheetState extends State<_GroupModelSheet> {
                 _pid = v;
                 _selected = p;
                 _models = p.models;
-                if (widget.group.model?.isNotEmpty == true) _model.text = widget.group.model!;
+                // 与私聊一致：切换接口后使用新接口默认模型，避免沿用旧模型名报错。
+                _model.text = p.model;
               }),
             ),
           const SizedBox(height: 8),

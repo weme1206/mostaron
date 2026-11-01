@@ -918,7 +918,12 @@ class AppDatabase {
       return v is String ? v : '';
     }
 
-    // 2) 插入数据表（不覆盖已存在数据：同 id 跳过）
+    // 2) 插入数据表：业务数据同 id 跳过；应用设置必须覆盖，否则本机已有 settings 行时
+    // 导入的主题、字体、人设等会被静默忽略。不含接口配置的备份要保留本机默认接口。
+    final providersIncluded = data['providers_included'] == true ||
+        (data['providers_included'] == null && data['providers'] is List);
+    final localDefaultProviderId =
+        providersIncluded ? '' : (await loadSettings()).defaultProviderId;
     final insertedIds = <String, Set<String>>{};
     final tables = ['settings', 'providers', 'characters', 'sessions', 'messages', 'groups', 'memories', 'worldbook'];
     for (final t in tables) {
@@ -926,10 +931,25 @@ class AppDatabase {
       if (rows is List) {
         for (final r in rows) {
           try {
-            final id = await d.insert(t, r as Map<String, dynamic>, conflictAlgorithm: ConflictAlgorithm.ignore);
+            final row = Map<String, dynamic>.from(r as Map);
+            if (t == 'settings' && !providersIncluded && (row['key'] ?? '') == 'app') {
+              final raw = row['value'];
+              if (raw is String) {
+                final obj = jsonDecode(raw);
+                if (obj is Map) {
+                  final settings = Map<String, dynamic>.from(obj);
+                  settings['default_provider_id'] = localDefaultProviderId;
+                  row['value'] = jsonEncode(settings);
+                }
+              }
+            }
+            final id = await d.insert(t, row,
+                conflictAlgorithm: t == 'settings'
+                    ? ConflictAlgorithm.replace
+                    : ConflictAlgorithm.ignore);
             if (id != 0) {
               // settings 表主键是 key，其余表主键是 id
-              final pk = t == 'settings' ? (r['key'] ?? '').toString() : (r['id'] ?? '').toString();
+              final pk = t == 'settings' ? (row['key'] ?? '').toString() : (row['id'] ?? '').toString();
               (insertedIds[t] ??= <String>{}).add(pk);
             }
           } catch (_) {}
@@ -973,6 +993,10 @@ class AppDatabase {
           final map = Map<String, dynamic>.from(obj);
           if (pathMap.containsKey(map['user_avatar'])) map['user_avatar'] = pathMap[map['user_avatar']];
           if (pathMap.containsKey(map['chat_background'])) map['chat_background'] = pathMap[map['chat_background']];
+          // 此循环读取的是原始备份，需再次保留本机默认接口，避免被清空的备份值覆盖。
+          if (!providersIncluded && key == 'app') {
+            map['default_provider_id'] = localDefaultProviderId;
+          }
           await d.update('settings', {'value': jsonEncode(map)},
               where: 'key = ?', whereArgs: [key]);
         } catch (_) {}

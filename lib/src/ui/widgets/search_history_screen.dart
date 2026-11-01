@@ -165,7 +165,9 @@ class _SearchHistoryScreenState extends State<SearchHistoryScreen> {
                         itemBuilder: (context, i) {
                           final m = _results[i];
                           final senderName = widget.characterId != null
-                              ? (_char?.name ?? '角色')
+                              ? (m.role == 'user'
+                                  ? state.settings.personaName
+                                  : (_char?.name ?? '角色'))
                               : (m.role == 'user'
                                   ? (state.settings.personaName)
                                   : (_members[m.senderCharacterId]?.name ?? '?'));

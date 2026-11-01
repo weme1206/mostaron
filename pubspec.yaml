@@ -2,7 +2,7 @@ name: mostaron
 description: "mostaron - AI 瑙掕壊鎵紨鑱婂ぉ"
 publish_to: 'none'
 
-version: 1.6.0+46
+version: 1.6.1+49
 
 environment:
   sdk: ^3.13.2

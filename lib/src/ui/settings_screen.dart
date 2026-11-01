@@ -13,6 +13,7 @@ import 'theme.dart';
 import '../utils/colors.dart';
 import '../utils/file_adopt.dart';
 import 'widgets/color_picker.dart';
+import 'widgets/avatars.dart';
 import 'avatar_crop_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
@@ -472,11 +473,8 @@ class _AvatarSectionState extends State<_AvatarSection> {
     final s = context.watch<AppState>().settings;
     return Card(
       child: ListTile(
-        leading: CircleAvatar(
-          radius: 22,
-          backgroundImage: s.userAvatar.isNotEmpty ? FileImage(File(s.userAvatar)) : null,
-          child: s.userAvatar.isEmpty ? const Icon(Icons.person) : null,
-        ),
+        // 统一走头像组件：文件被清理或使用内置头像时都有安全兜底。
+        leading: buildUserAvatar(context, s, 44),
         title: const Text('我的头像'),
         subtitle: Text(s.userAvatar.isEmpty ? '未设置' : '已设置'),
         onTap: () async {
@@ -818,8 +816,8 @@ class _DataSectionState extends State<_DataSection> {
           ListTile(
             leading: const Icon(Icons.download),
             title: const Text('导入全部数据'),
-            subtitle: const Text('从 JSON 备份恢复（与现有数据合并，同 ID 跳过、不覆盖；'
-                '备份里没有接口配置时接口需自己重新配置）'),
+            subtitle: const Text('从 JSON 备份恢复（角色等数据同 ID 跳过，应用设置会恢复；'
+                '备份里没有接口配置时保留本机接口设置）'),
             onTap: _busy ? null : () async {
               setState(() => _busy = true);
               final ok = await context.read<AppState>().importFromFile();
